@@ -169,6 +169,7 @@ RLHF 通常分三步走：**SFT**（使用监督数据微调）、**奖励模型
 
 **损失函数**  
 使用 **pairwise ranking loss**（对比损失）：
+
 $$
 \mathcal{L} = -\log \sigma\left(r_\theta(x, y_{\text{chosen}}) - r_\theta(x, y_{\text{rejected}})\right)
 $$
@@ -197,9 +198,11 @@ PPO 是在线 RL 算法，它将奖励模型作为环境，通过交互式采样
 2. **打分**：用奖励模型计算每个回答的奖励 $r(x,y)$。
 3. **优势估计**：使用 GAE（Generalized Advantage Estimation）计算每个 token 的优势函数 $A_t$，通常需要一个 critic 模型（价值网络）来估计状态价值。
 4. **策略更新**：最大化目标函数
+
    $$
    \mathcal{L}_{\text{PPO}} = \mathbb{E} \left[ \min\left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)} A, \ \text{clip}\left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}, 1-\epsilon, 1+\epsilon \right) A \right) \right]
    $$
+
    同时加入 KL 散度惩罚项，防止策略偏离参考策略（通常是 SFT 模型）太远。
 5. **价值更新**：更新 critic 网络，减小价值估计误差。
 
@@ -244,6 +247,7 @@ $$
 其中 $G$ 为每组采样回答数。
 
 **策略损失**（带 clip）：
+
 $$
 \mathcal{L}_{\text{GRPO}} = -\frac{1}{G}\sum_{i=1}^G \min\left( \frac{\pi_\theta(o_i|x)}{\pi_{\text{ref}}(o_i|x)} A_i,\ \text{clip}\left(\frac{\pi_\theta(o_i|x)}{\pi_{\text{ref}}(o_i|x)}, 1-\epsilon,1+\epsilon\right) A_i \right)
 $$
@@ -280,6 +284,7 @@ $$
 
 **内存占用**  
 KV Cache 的大小为：  
+
 $$
 \text{内存} = 2 \times \text{batch\_size} \times \text{num\_heads} \times \text{seq\_len} \times \text{head\_dim} \times \text{sizeof(dtype)}
 $$

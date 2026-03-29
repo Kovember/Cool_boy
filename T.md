@@ -4,7 +4,7 @@
 
 ### 1.1 MLP—固定窗口的映射
 
-对于固定窗口大小为 $T$ 的输入序列 \(X = [x_1, x_2, ..., x_T] \in \mathbb{R}^{T \times d}\)，MLP 将每个位置独立处理：
+对于固定窗口大小为 $T$ 的输入序列 $X = [x_1, x_2, ..., x_T] \in \mathbb{R}^{T \times d}$，MLP 将每个位置独立处理：
 
 输入窗口长度固定，需展平为 $\text{vec}(X) \in \mathbb{R}^{Td}$：
 
@@ -47,12 +47,14 @@ Transformer的端到端模型：
 
 * 嵌入层（Embedding）
 
-  - **Token 嵌入**：将输入 token 映射为稠密向量  
+  - **Token 嵌入**：将输入 token 映射为稠密向量
+
     $$
     \mathbf{X}_{\text{token}} = \text{Lookup}(E, \text{tokens}), \quad E \in \mathbb{R}^{V \times d_{\text{model}}}
     $$
 
   - **位置编码**：注入序列顺序信息
+
     $$
     \mathbf{X} = \mathbf{X}_{\text{token}} + \mathbf{P}, \quad \mathbf{P} \in \mathbb{R}^{T \times d_{\text{model}}}
     $$
@@ -60,20 +62,25 @@ Transformer的端到端模型：
 * 注意力层（Attention）
 
   - **缩放点积注意力**：  
+
     $$
     \text{Attn}(Q,K,V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
     $$
 
-  - **多头注意力**（自注意力情形，$Q=K=V=\mathbf{X}$）：  
+  - **多头注意力**（自注意力情形，$Q=K=V=\mathbf{X}$）：
+
     $$
     \text{MultiHead}(\mathbf{X}) = \text{Concat}(\text{head}_1,...,\text{head}_h)W^O
     $$
+
     其中 $\text{head}_i = \text{Attn}(\mathbf{X}W_i^Q,\ \mathbf{X}W_i^K,\ \mathbf{X}W_i^V)$。
 
 * 前馈层（FFN）
+
   $$
   \text{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2
   $$
+
   或写作 $\text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2$
 
 ## 2 Transformer 的架构组成
@@ -97,6 +104,7 @@ Transformer的端到端模型：
 **三种主流方式**：
 
 1. **Sinusoidal（正弦/余弦）编码**（原始 Transformer）
+
    $$
    PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{model}}}\right),\quad 
    PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{model}}}\right)
@@ -121,11 +129,13 @@ Transformer的端到端模型：
    $$
 
    其中旋转矩阵为：
+
    $$
    R_{\theta_i}(m) = \begin{pmatrix} \cos m\theta_i & -\sin m\theta_i \\ \sin m\theta_i & \cos m\theta_i \end{pmatrix}
    $$
 
    实际计算中不显式构造矩阵，而是利用复数乘法或按维度公式：
+
    $$
    \begin{aligned}
    q'_0 &= q_0 \cos m\theta_i - q_1 \sin m\theta_i \\
@@ -169,6 +179,7 @@ Transformer的端到端模型：
 #### ① 缩放点积注意力（Scaled Dot-Product Attention）
 
 **公式**：
+
 $$
 \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
 $$
@@ -257,6 +268,7 @@ def multi_head_attention(x, num_heads, d_model):
 #### ① 前馈网络（FFN）
 
 **公式**：
+
 $$
 \text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2
 $$
@@ -267,17 +279,21 @@ $$
   Attention 负责在**不同 token 之间**交换信息（线性加权），FFN 负责在**每个 token 内部**做非线性变换，提升模型表达能力。两者交替，形成了 Transformer 的“通信-计算”结构。
 
 **现代变体**（如 LLaMA 使用 SwiGLU）：
+
 $$
 \text{SwiGLU}(x) = \text{Swish}(xW_1) \odot (xW_2)
 $$
+
 效果更好，但参数略多。
 
 #### ② 残差连接 + 层归一化（Residual + LayerNorm）
 
 **结构**：
+
 $$
 \text{Output} = \text{LayerNorm}(x + \text{Sublayer}(x))
 $$
+
 （原始 Transformer 为 Post-Norm，现代更常用 Pre-Norm）
 
 - **Why 残差？**  
@@ -355,6 +371,7 @@ $$
 
 **公式**：
 对于 token $x$，Router 输出 logits $h(x) = W_g x$（$W_g \in \mathbb{R}^{E \times d}$），然后 softmax 得到概率 $p = \text{softmax}(h(x))$。选择 Top-K 索引集合 $\mathcal{T}$，最终输出：
+
 $$
 y = \sum_{i \in \mathcal{T}} p_i \cdot \text{Expert}_i(x)
 $$
@@ -373,9 +390,11 @@ $$
 
 **公式**（简化）：
 设 batch 中有 $ T $ 个 token，每个 token 有路由分数 $s_{t,i}$ 表示 token $ t $ 与专家 $i$ 的匹配度。专家 $i$ 选择分数最高的 $C_i$ 个 token（$C_i$ 可以是容量，如 $C_i = \text{capacity\_factor} \times T/E$）。被选中的 token 集合记为 $\mathcal{T}_i$，专家 $i$ 输出 $y_{t,i} = \text{Expert}_i(x_t)$。最终 token $ t $ 的输出为：
+
 $$
 y_t = \sum_{i: t \in \mathcal{T}_i} \frac{s_{t,i}}{\sum_{t' \in \mathcal{T}_i} s_{t',i}} \cdot y_{t,i}
 $$
+
 即用该 token 在专家 i 的选中集合中的归一化分数作为权重。
 
 **特点**：
@@ -397,9 +416,11 @@ Router的本质是一个线性层 $W_g \in \mathbb{R}^{E \times d}$，输入 tok
 **关点**：
 
 - **噪声注入**（训练时）：Switch Transformer 等模型在路由 logits 中添加可调节的高斯噪声，鼓励探索，防止 Router 过早收敛到次优分配。公式：
+
   $$
   z_i = \frac{x \cdot W_g^{(i)} + \epsilon \cdot \text{Softplus}(x \cdot W_{\text{noise}}^{(i)})}{\text{temperature}}
   $$
+
   其中 $\epsilon \sim \mathcal{N}(0,1)$，$W_{\text{noise}}$ 是可学习的噪声参数。训练初期噪声大，后期逐渐降低。
 
 - **温度系数**：可以引入温度 $ T $ 来平滑或锐化分布。$T<1$ 使分布更尖锐（偏向最大专家），$T>1$ 更平滑。通常 $T=1$。
@@ -446,9 +467,11 @@ Router的本质是一个线性层 $W_g \in \mathbb{R}^{E \times d}$，输入 tok
 这是最常用的方法，在训练目标中加入一个辅助损失，惩罚负载不均衡。常见的两种形式：
 
 **a) Importance-based Loss（Switch Transformer）**
+
 $$
 \mathcal{L}_{\text{aux}} = \alpha \cdot \sum_{i=1}^{E} f_i \cdot P_i
 $$
+
 其中：
 
 - $f_i = \frac{1}{T} \sum_{t=1}^{T} \mathbb{1}\{\text{token } t \text{ 选择专家 } i\}$，即专家 $i$ 被选中的 token 比例。
@@ -459,9 +482,11 @@ $$
 
 **b) Load-based Loss（GShard）**
 直接基于每个专家实际处理的 token 数量 $l_i$ 计算方差或与均值的差异：
+
 $$
 \mathcal{L}_{\text{aux}} = \alpha \cdot \sum_{i=1}^{E} \left( \frac{l_i}{T} - \frac{1}{E} \right)^2
 $$
+
 更直接地强制每个专家处理的 token 数量相等。
 
 **面试考察点**：
@@ -474,9 +499,11 @@ $$
 **原理**：鼓励 Router 的输出概率分布更“均匀”（即高熵），避免分布过于集中在少数专家上。
 
 **公式**：
+
 $$
 \mathcal{L}_{\text{entropy}} = -\alpha \cdot \frac{1}{T} \sum_{t=1}^{T} \sum_{i=1}^{E} p_{t,i} \log p_{t,i}
 $$
+
 最大化熵（最小化负熵）使分布平坦，从而每个 token 不会过分依赖单一专家，间接促进专家利用的多样性。
 
 **与辅助损失的区别**：
