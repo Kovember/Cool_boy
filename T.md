@@ -358,7 +358,7 @@ $$
 **原理**：每个 token 独立地选择最合适的 Top-K 个专家。Router 对每个 token 输出一个对所有专家的概率分布，然后每个 token 挑选概率最高的 K 个专家，将自身的表示发送给这些专家，专家的输出按路由概率加权求和。
 
 **公式**：
-对于 token $`x`$，Router 输出 logits $`h(x) = W_g x$（$W_g \in \mathbb{R}^{E \times d}`$），然后 softmax 得到概率 $`p = \text{softmax}(h(x))`$。选择 Top-K 索引集合 $`\mathcal{T}`$，最终输出：
+对于 token $`x`$，Router 输出 logits $`h(x) = W_g x`$（$`W_g \in \mathbb{R}^{E \times d}`$），然后 softmax 得到概率 $`p = \text{softmax}(h(x))`$。选择 Top-K 索引集合 $`\mathcal{T}`$，最终输出：
 
 $$
 y = \sum_{i \in \mathcal{T}} p_i \cdot \text{Expert}_i(x)
