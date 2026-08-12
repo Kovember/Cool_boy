@@ -96,25 +96,18 @@ Harness Engineering 进一步处理模型调用之外的问题：
 
 ```mermaid
 flowchart LR
-    P["Prompt Engineering<br/>让模型理解任务"]
-    C["Context Engineering<br/>让模型看到正确信息"]
-    H["Harness Engineering<br/>让模型可靠地行动"]
+    P["Prompt Engineering<br/>指令 · 示例 · 输出格式<br/>让模型理解任务"]
+    C["Context Engineering<br/>RAG · Memory · 压缩 · 预算<br/>让模型看到正确信息"]
+    H["Harness Engineering<br/>Runtime · Tool · State · Sandbox<br/>让模型可靠地行动"]
 
-    P -->|"加入检索、历史与环境"| C
-    C -->|"加入执行、状态与治理"| H
-
-    P1["指令 · 示例 · 输出格式"] -.-> P
-    C1["RAG · Memory · 压缩 · 预算"] -.-> C
-    H1["Runtime · Tool · State<br/>Sandbox · Orchestration"] -.-> H
+    P -->|"增加信息"| C -->|"增加执行与治理"| H
 
     classDef prompt fill:#EEF2FF,stroke:#6366F1,color:#312E81,stroke-width:1.5px;
     classDef context fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.5px;
     classDef harness fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:2px;
-    classDef note fill:#F8FAFC,stroke:#94A3B8,color:#334155,stroke-dasharray:4 3;
     class P prompt;
     class C context;
     class H harness;
-    class P1,C1,H1 note;
 ```
 
 | 阶段 | 核心问题 | 主要机制 | 仍未解决的问题 |
@@ -147,47 +140,34 @@ Task Orchestration
 ```
 
 ```mermaid
-flowchart TB
-    U["用户 / 业务系统"] --> RT
+flowchart LR
+    U["用户 / 业务系统"]
+    CB["Context Builder<br/>组装本轮模型输入"]
+    RT["Agent Runtime<br/>状态 · 控制 · 预算"]
+    LOOP["ReAct Loop<br/>Model ⇄ Tool"]
+    OUT["最终输出"]
 
-    subgraph HARNESS["Agent Harness"]
-        direction TB
-        RT["Agent Runtime<br/>状态机 · 暂停/恢复 · 重试 · 预算"]
-        CB["Context Builder<br/>选择 · 去重 · 压缩 · 排序"]
-        LOOP["ReAct Loop"]
-        MODEL["Model Call"]
-        EXEC["Tool Executor<br/>Schema · Policy · Approval · Retry"]
+    U --> CB --> RT --> LOOP --> OUT
 
-        RT --> CB --> LOOP
-        LOOP --> MODEL
-        MODEL -->|"Tool Call"| EXEC
-        EXEC -->|"Tool Result"| LOOP
-        MODEL -->|"最终输出"| RT
-    end
+    STATE[("Thread State<br/>Event · Checkpoint")]
+    KNOW[("Memory / RAG")]
+    TOOL["Tool Executor<br/>Local · MCP · Subagent"]
+    OBS["Trace / Metric / Audit"]
 
-    THREAD[("Thread / Event / Checkpoint")]
-    MEMORY[("User Memory / RAG")]
-    TOOLS["Local Tool · MCP Server · Subagent"]
-    ENV["Workspace / Sandbox / External Systems"]
-    OBS["Trace · Metric · Audit"]
-
-    THREAD <--> RT
-    THREAD --> CB
-    MEMORY --> CB
-    EXEC <--> TOOLS
-    TOOLS <--> ENV
+    STATE -.-> CB
+    KNOW -.-> CB
+    RT -.-> STATE
+    LOOP <--> TOOL
     RT -.-> OBS
-    CB -.-> OBS
-    EXEC -.-> OBS
 
     classDef core fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
     classDef control fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
     classDef store fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.4px;
     classDef external fill:#F8FAFC,stroke:#64748B,color:#1E293B,stroke-width:1.2px;
-    class RT,CB,EXEC control;
-    class LOOP,MODEL core;
-    class THREAD,MEMORY store;
-    class TOOLS,ENV,OBS external;
+    class RT,CB control;
+    class LOOP core;
+    class STATE,KNOW store;
+    class U,OUT,TOOL,OBS external;
 ```
 
 最基本的架构原则是：
@@ -664,28 +644,15 @@ Tool-call 是模型作用于外部世界的统一通道。无论底层是 Python
 ```mermaid
 flowchart LR
     M["Model"]
-    FC["Function Calling<br/>结构化动作意图"]
-    H["Harness / Tool Executor"]
-    LOCAL["Local Tool<br/>Python · Shell · Browser"]
-    MCP["MCP Client"]
-    SERVER["MCP Server<br/>远程 Tool / Resource"]
-    SKILL["Skill<br/>指令 · 流程 · 资源"]
+    FC["Function Calling<br/>模型输出结构化动作"]
+    H["Harness<br/>校验 · 权限 · 路由 · 归一化"]
+    T["Tool<br/>Local Tool 或 MCP Server"]
 
-    M -->|"function_call JSON"| FC --> H
-    H -->|"直接执行"| LOCAL
-    H -->|"MCP Protocol"| MCP --> SERVER
-    H -->|"按需读取"| SKILL
-    SKILL -.->|"增强指令与工具使用方式"| M
-    LOCAL -->|"Tool Result"| H
-    SERVER -->|"Tool Result"| H
-    H -->|"归一化结果"| M
+    M -->|"Tool Call"| FC --> H -->|"执行"| T
+    T -->|"Tool Result"| H -->|"归一化结果"| M
 
-    subgraph B1["Model ↔ Harness 边界"]
-        FC
-    end
-    subgraph B2["Harness ↔ Tool Server 边界"]
-        MCP
-    end
+    SKILL["Skill<br/>按需加载指令、流程与资源"]
+    SKILL -.-> H
 
     classDef model fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
     classDef harness fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
@@ -693,8 +660,8 @@ flowchart LR
     classDef capability fill:#F8FAFC,stroke:#64748B,color:#1E293B,stroke-width:1.2px;
     class M model;
     class H harness;
-    class FC,MCP protocol;
-    class LOCAL,SERVER,SKILL capability;
+    class FC protocol;
+    class T,SKILL capability;
 ```
 
 ## 3.1 Tool 的本质
@@ -1592,37 +1559,25 @@ Memory 不是 Context 的同义词，也不是脱离 Thread 的“第二个大�
 > **Memory 属于用户级全局持久化数据，可以跨 Thread 复用；Goal、Plan、Task 属于单个 Thread 的 Durable State。模型通过 Tool-call 访问 User Memory（如`memory_search` 和 `memory_write`），Context Builder 也可以在模型调用前自动检索 Memory。**
 
 ```mermaid
-flowchart TB
-    subgraph STORE["User Memory Store"]
-        direction LR
-        P["Preference<br/>稳定偏好"]
-        S["Semantic<br/>背景事实"]
-        D["Decision<br/>决策与理由"]
-        R["Procedure<br/>可复用经验"]
-    end
-
+flowchart LR
+    STORE["User Memory Store<br/>Preference · Semantic<br/>Decision · Procedure"]
     TURN["当前任务<br/>User Input + Thread State"]
     QUERY["Query Construction<br/>目标 · 实体 · 约束"]
     RETRIEVE["Hybrid Retrieval<br/>关键词 + 向量 + 过滤"]
-    RANK["Rerank / Deduplicate<br/>相关性 · 新鲜度 · 置信度"]
-    CB["Context Builder<br/>按预算选中少量 Memory"]
-    INPUT["模型输入上下文"]
+    RANK["Rerank<br/>去重 · 新鲜度 · 置信度"]
+    CB["Context Builder<br/>按预算选择 Memory"]
     MODEL["Model"]
-    WRITE["memory_write<br/>抽取 · 验证 · 合并 · 版本化"]
 
-    TURN --> QUERY --> RETRIEVE
-    STORE --> RETRIEVE
-    RETRIEVE --> RANK --> CB --> INPUT --> MODEL
-    MODEL -->|"主动记忆"| WRITE --> STORE
-    TURN -.-> CB
+    TURN --> QUERY --> RETRIEVE --> RANK --> CB --> MODEL
+    STORE -.-> RETRIEVE
 
     classDef store fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.4px;
     classDef process fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.4px;
     classDef context fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
     classDef model fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
-    class P,S,D,R store;
-    class QUERY,RETRIEVE,RANK,WRITE process;
-    class TURN,CB,INPUT context;
+    class STORE store;
+    class QUERY,RETRIEVE,RANK process;
+    class TURN,CB context;
     class MODEL model;
 ```
 

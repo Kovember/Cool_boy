@@ -533,6 +533,169 @@ $$
 
 在实际大模型（如 Mixtral、DeepSeek-MoE）中，通常**组合使用**多种方法：主要依赖辅助损失（负载均衡损失），配合熵正则化，同时设置合理的容量因子（硬约束），以保证训练稳定性和专家利用率。
 
+### 5 多模态大模型：从图像到语言 Token
+
+文本模型接收离散 Token ID，而图像本质上是像素矩阵。多模态模型首先要解决的不是“让 LLM 看图”，而是三个更具体的问题：
+
+1. 如何把大小不一的图像转换成一串视觉 Token；
+2. 如何把视觉特征对齐到 LLM 的表示空间；
+3. 如何让文本 Token 在生成过程中读取并引用视觉信息。
+
+先看一条最常见的视觉语言模型链路：
+
+```text
+Image → Patchify → Vision Encoder → Projector / Resampler
+      → Visual Tokens + Text Tokens → LLM → Text / Tool Call / JSON
+```
+
+#### 5.1 第一步：把图像切成 Patch
+
+ViT 把图像切成固定大小的 Patch，再把每个 Patch 展平并线性投影。若输入尺寸为 $H\times W$，Patch 尺寸为 $P\times P$，视觉 Token 数为：
+
+$$
+N_{vision}=\frac{H}{P}\times\frac{W}{P}
+$$
+
+例如 `448×448` 图像使用 `14×14` Patch，会产生 `32×32=1024` 个 Patch Token。长宽同时翻倍时，Token 数变为 4 倍；视觉细节增加的同时，LLM 的 Context、Prefill 和 KV Cache 压力也随之上升。
+
+Patch Embedding 本质上可用一个步长等于 Patch 大小的卷积实现：
+
+```python
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels=3, hidden_size=1024, patch_size=14):
+        super().__init__()
+        self.proj = nn.Conv2d(
+            in_channels, hidden_size,
+            kernel_size=patch_size, stride=patch_size,
+        )
+
+    def forward(self, image):              # [B, 3, H, W]
+        feature = self.proj(image)          # [B, D, H/P, W/P]
+        return feature.flatten(2).transpose(1, 2)  # [B, N, D]
+```
+
+Patch 越小，局部细节越充分，但 Token 数和计算成本越高；Patch 越大则更便宜，但 OCR、小物体和细粒度定位更容易丢失信息。
+
+#### 5.2 第二步：Vision Encoder 提取视觉语义
+
+Patch Embedding 只完成像素分块，还不包含高级语义。Vision Encoder 通常是 ViT：为 Patch Token 加入二维位置信息，再经过多层 Self-Attention 和 FFN，使一个局部 Patch 能融合整张图的上下文。
+
+二维位置信息尤其重要：文字“猫在桌子下面”不仅依赖物体是什么，还依赖它们的相对位置。常见方案包括绝对位置 Embedding、二维 RoPE、相对位置 Bias。输入分辨率变化后，固定位置 Embedding 还需要插值；处理不当会导致高分辨率或非训练宽高比下能力下降。
+
+Vision Encoder 的输出通常为：
+
+$$
+F_v\in\mathbb{R}^{B\times N_{vision}\times D_v}
+$$
+
+它已经包含视觉语义，但维度 $D_v$、数值分布和 Token 数量通常都与 LLM 不匹配，因此不能简单地把它当作文本 Embedding 使用。
+
+#### 5.3 第三步：Projector 对齐视觉与语言空间
+
+Projector 将视觉特征从 $D_v$ 映射到 LLM hidden size $D_l$：
+
+$$
+F_l=Projector(F_v),\qquad F_l\in\mathbb{R}^{B\times N'\times D_l}
+$$
+
+常见方案的区别是“保留多少视觉 Token”：
+
+| 方案 | 做法 | 特点 |
+|---|---|---|
+| Linear / MLP | 每个 Patch 独立映射到 LLM 维度 | 简单、细节保留多，但视觉 Token 较长 |
+| Q-Former / Resampler | 用固定数量的 Query 从全部视觉特征中抽取信息 | Token 数稳定，但压缩可能损失 OCR 和局部细节 |
+| Token Merger | 合并相邻或相似 Token | 在细节与计算之间动态折中 |
+
+最简单的 Projector 只是一个 MLP：
+
+```python
+projector = nn.Sequential(
+    nn.Linear(vision_dim, llm_dim),
+    nn.GELU(),
+    nn.Linear(llm_dim, llm_dim),
+)
+visual_tokens = projector(vision_features)
+```
+
+Projector 不是单纯“修改维度”。训练会让它学习：哪些视觉模式应落到 LLM 已有的语义空间，以及视觉 Token 应以怎样的分布进入语言模型。
+
+#### 5.4 第四步：视觉 Token 如何进入 LLM
+
+主流融合方式可以分成两类。
+
+**Token 拼接式（Decoder-only）**：把 `<image>` 占位符替换为视觉 Embedding，再与文本 Embedding 一起送入 LLM：
+
+```text
+<BOS> User: [IMG_START] v1 v2 ... vN [IMG_END] 描述这张图
+Assistant: ...
+```
+
+```python
+text_embeds = llm.embed_tokens(input_ids)
+inputs_embeds = replace_image_placeholders(text_embeds, visual_tokens)
+logits = llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
+```
+
+这类架构复用原有 Decoder-only LLM，工程简单；代价是视觉 Token 直接占用 Context，且所有视觉信息都参与 LLM Self-Attention。
+
+**Cross-Attention 式**：文本仍走 LLM 主干，在部分层增加 Cross-Attention，让文本 Query 读取视觉 K/V。它不必把全部视觉 Token 塞进文本序列，但需要修改 LLM 结构和训练方式。
+
+无论采用哪种方式，模型最终仍是自回归预测下一个文本 Token。视觉信息改变的是每一步预测所能读取的条件，而不是输出头的基本形式。
+
+#### 5.5 分辨率、宽高比与多图输入
+
+固定 Resize 会把所有图像拉成同一尺寸，Batch 简单，但可能造成形变或细节丢失。常见改进包括：
+
+- **Dynamic Resolution**：保留宽高比，将图像调整到若干允许尺寸，并动态产生视觉 Token；
+- **Tiling / Any-resolution**：保留一张低分辨率全局图，同时把原图切成多个高分辨率局部块；
+- **Thumbnail + Crops**：全局缩略图负责整体关系，局部 Crop 负责 OCR 和细节。
+
+Tiling 的难点是局部块数量可能暴涨，而且模型必须知道每块在原图中的空间位置。多图输入还要加入图像边界和序号，防止模型把图 1 的证据错误归到图 2。
+
+#### 5.6 多模态模型如何训练出来
+
+多模态能力通常不是一步 SFT 得到，而是逐阶段对齐：
+
+1. **Feature Alignment**：冻结 Vision Encoder 与 LLM，只训练 Projector，用图文对让视觉特征进入语言空间；
+2. **Multimodal Pretraining**：使用大规模 Caption、OCR、文档和交错图文数据，学习视觉概念与语言之间的对应；
+3. **Multimodal SFT**：训练图像问答、图表理解、Grounding、多轮对话和结构化输出；
+4. **Preference Alignment**：通过 DPO/RLHF 等方法改善视觉幻觉、拒答、安全和回答风格。
+
+第一阶段只解决“看见的特征能否被 LLM 接收”；SFT 才进一步解决“是否按照用户指令使用这些信息”。如果 Vision Encoder 没有提取出小字或目标边界，只训练语言侧 LoRA 也无法凭空恢复这些信息。
+
+#### 5.7 训练目标与 Label Mask
+
+最常见的训练目标仍是文本的 Next Token Prediction。图像占位符、视觉 Token、System 和 User 内容用于提供条件，通常只对 Assistant 回答计算语言模型损失：
+
+```text
+图像 Token：mask    用户问题：mask    Assistant 答案：计算 loss
+```
+
+若任务包含 Bounding Box、Point、OCR 坐标或 Tool Call，可以把位置离散成特殊 Token 继续使用语言模型损失，也可以增加单独的检测/对齐损失。前者协议统一，后者通常对连续空间定位更直接。
+
+#### 5.8 推理成本与常见瓶颈
+
+一次多模态请求通常包含两段 Prefill：先运行 Vision Encoder，再让 LLM 消化视觉 Token 与文本 Token。主要瓶颈包括：
+
+- 高分辨率或多图导致视觉 Token 数过多，TTFT 明显增长；
+- 不同图像 Token 数差异大，Batch 中 padding 浪费严重；
+- Vision Encoder 与 LLM 的计算形态不同，资源利用不均；
+- 图片预处理、下载和解码可能成为 GPU 之外的延迟来源；
+- 视觉特征缓存可以避免重复编码，但必须绑定图片内容、预处理配置和模型版本。
+
+因此，多模态服务不能只按文本 Token 限流，通常要将图像数量、像素数或估算后的视觉 Token 一起计入 Admission Control。
+
+**常见问题**
+
+1. **Projector 与 Vision Encoder 分别解决什么问题？**
+   Vision Encoder 从像素提取语义；Projector 将视觉语义映射或压缩到 LLM 能消费的表示空间。
+2. **为什么分辨率翻倍后成本可能接近四倍？**
+   长宽同时翻倍时 Patch 数变为四倍，并进一步增加 LLM Prefill 的序列长度。
+3. **Token 拼接与 Cross-Attention 如何选择？**
+   拼接式结构简单、便于复用现有 LLM；Cross-Attention 能更独立地读取视觉特征，但需要修改模型结构。
+4. **视觉幻觉只是语言模型的问题吗？**
+   不是。它可能来自视觉特征缺失、模态对齐不足、训练数据偏差，也可能来自解码阶段语言先验压过视觉证据。
+
 ## 二、后训练、对齐与推理工程
 
 ### 1 SFT 与参数高效微调
@@ -710,6 +873,27 @@ $$
 
 常用初始化是 $A$ 随机、$B=0$，使训练开始时 LoRA 分支输出为 0，模型与基座模型完全一致。`lora_dropout` 仅应在数据小、过拟合明显时使用。
 
+下面这个最小实现把公式中的两条路径直接对应到代码。`base` 冻结，反向传播只更新 `A/B`：
+
+```python
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank=8, alpha=16):
+        super().__init__()
+        self.base = base.requires_grad_(False)
+        self.A = nn.Parameter(torch.empty(rank, base.in_features))
+        self.B = nn.Parameter(torch.zeros(base.out_features, rank))
+        self.scale = alpha / rank
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scale
+
+    def merged_weight(self):
+        return self.base.weight + self.scale * (self.B @ self.A)
+```
+
+这里最值得检查的不是代码能否运行，而是：目标 Linear 是否真的被替换、基座参数是否冻结、`B=0` 是否保证初始输出不变，以及 merge 前后 logits 是否足够接近。
+
 ##### 1.4.2 LoRA 训练步骤
 
 1. 固定 base model revision、tokenizer、chat template 和数据版本；
@@ -772,6 +956,21 @@ $$
 
 $T>1$ 将分布变平，暴露非目标类的相对概率；$T^2$ 用于补偿温度带来的梯度缩放。KL 方向应明确表示「用学生逼近教师」，实现时需核对库函数的 input/target 语义。
 
+PyTorch 的 `kl_div(input, target)` 要求 `input` 是 log-probability，因此实现时教师与学生的位置不能写反：
+
+```python
+def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
+    hard = F.cross_entropy(student_logits, labels)
+    soft = F.kl_div(
+        F.log_softmax(student_logits / T, dim=-1),
+        F.softmax(teacher_logits.detach() / T, dim=-1),
+        reduction="batchmean",
+    ) * (T * T)
+    return (1 - alpha) * hard + alpha * soft
+```
+
+教师输出要 `detach`，否则会无意中为教师构建反向图；生成任务还需对 padding 和非目标 Token 做 mask，不能直接把所有位置平均。
+
 生成模型的 logits 维度是 vocabulary，完整存储成本很高，可以只保留 top-k logits 与剩余概率质量，但要注意 teacher/student tokenizer 不同时无法直接对齐 Token 分布。
 
 ##### 1.5.2 Sequence-level Distillation
@@ -822,50 +1021,11 @@ $T>1$ 将分布变平，暴露非目标类的相对概率；$T^2$ 用于补偿�
 3. **学生模型比教师更好是否矛盾？**
    不矛盾。在特定窄域任务上，数据过滤、多教师集成和更匹配的训练分布可以让学生超过单次教师输出，但不代表学生的通用能力更强。
 
-#### 1.6 多模态大模型
+#### 1.6 多模态 SFT 全流程
 
-多模态大模型将图像、视频、音频等非文本信号转换成 LLM 可以处理的 Token 表示。以视觉语言模型为例，常见架构为：
+前文已经说明视觉 Token 如何经过 Vision Encoder、Projector 进入 LLM。本节只关注在这一模型结构上如何组织监督数据、选择可训练模块并完成领域微调。
 
-```text
-Image
-  → Vision Encoder（ViT / ConvNet）
-  → Visual Features
-  → Projector / Resampler / Q-Former
-  → Visual Tokens
-  → LLM 与 Text Tokens 联合建模
-  → Text / Structured Output
-```
-
-##### 1.6.1 Vision Encoder
-
-ViT 将图像分成 Patch，每个 Patch 投影为向量后通过 Transformer 编码。如果图像尺寸为 $H\times W$，Patch 尺寸为 $P\times P$，则视觉 Token 数约为：
-
-$$
-N_{vision}=\frac{H}{P}\times\frac{W}{P}
-$$
-
-提高分辨率可以保留更多细节，但视觉 Token 数按面积增长，会显著占用 Context 和 Prefill 计算。对 OCR、图表和小物体场景，常使用 dynamic resolution、tiling 或 any-resolution 策略。
-
-##### 1.6.2 Modality Projector
-
-Vision Encoder 与 LLM 的 hidden dimension、特征分布和 Token 数通常不同，Projector 负责对齐两个表示空间。
-
-- **Linear/MLP Projector**：结构简单，保留全部 Patch Token；
-- **Q-Former/Resampler**：用固定数量的可学习 Query 压缩视觉特征，减少进入 LLM 的 Token；
-- **Token Merger**：将局部相似视觉 Token 合并，在细节与成本之间取舍。
-
-##### 1.6.3 多模态对齐的阶段
-
-常见训练顺序为：
-
-1. **Feature Alignment**：冻结 Vision Encoder 和 LLM，只训练 Projector，让视觉特征进入语言空间；
-2. **Multimodal Pretraining**：用大规模图文对学习视觉概念与语言的对应；
-3. **Multimodal SFT**：用图像问答、OCR、图表、Grounding、多轮对话和结构化任务训练指令跟随；
-4. **Preference Alignment**：对幻觉、拒答、安全和输出风格进行 DPO/RLHF 对齐。
-
-#### 1.7 多模态 SFT 全流程
-
-##### 1.7.1 数据格式
+##### 1.6.1 数据格式
 
 一条数据需要同时表达对话和媒体引用：
 
@@ -883,7 +1043,7 @@ Vision Encoder 与 LLM 的 hidden dimension、特征分布和 Token 数通常不
 
 图像顺序必须与 `<image>` 占位 Token 一致，多图输入还要明确「图 1 / 图 2」的指代。训练与推理必须共用相同的 image processor、resize/crop 策略、归一化参数和 chat template。
 
-##### 1.7.2 训练哪些模块
+##### 1.6.2 训练哪些模块
 
 | 策略 | 显存/成本 | 适用场景 |
 |---|---:|---|
@@ -894,13 +1054,13 @@ Vision Encoder 与 LLM 的 hidden dimension、特征分布和 Token 数通常不
 
 只对 LLM 做 LoRA 能改善指令遵循，但如果问题来自 Vision Encoder 没有提取出关键细节，语言侧无法凭空恢复丢失的视觉信息。
 
-##### 1.7.3 Batch 与显存
+##### 1.6.3 Batch 与显存
 
 图像分辨率不同会导致视觉 Token 数差异很大。如果只按样本数组 batch，少量高分辨率图像就可能 OOM。更稳定的方式是按「文本 Token + 视觉 Token」总预算做 bucketing 和 dynamic batching。
 
 多模态训练常结合 BF16、FlashAttention、gradient checkpointing、sequence packing 和 LoRA/QLoRA。Packing 时要确保媒体特征的 offset 与文本占位 Token 一致，不能只拼接 `input_ids`。
 
-##### 1.7.4 数据配比与能力退化
+##### 1.6.4 数据配比与能力退化
 
 数据应同时覆盖：
 
@@ -912,7 +1072,7 @@ Vision Encoder 与 LLM 的 hidden dimension、特征分布和 Token 数通常不
 
 如果训练集中每张图都必然有答案，模型容易学会在证据不足时也强行描述，形成视觉幻觉。
 
-##### 1.7.5 评估
+##### 1.6.5 评估
 
 多模态评估不能只使用通用 VQA Accuracy，还应分别观察：
 
@@ -1160,6 +1320,20 @@ $$
 
 对称量化计算更简单，常用于权重；非对称量化能更好覆盖不对称分布，但需处理 zero point。
 
+以权重矩阵按输出通道量化为例，每一行独立计算 scale，避免一个异常通道拉低其他通道的有效精度：
+
+```python
+def quantize_per_channel(weight):          # [out_features, in_features]
+    scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127
+    qweight = (weight / scale).round().clamp(-127, 127).to(torch.int8)
+    return qweight, scale
+
+def dequantize(qweight, scale):
+    return qweight.float() * scale
+```
+
+这段代码用于解释量化关系，不代表高性能 Kernel：真实推理需要在算子内部完成反量化或直接执行 INT8 GEMM，否则显式还原整块 FP 权重可能省显存却不省延迟。
+
 ##### 3.3.2 Per-tensor、Per-channel 与 Per-token
 
 - **Per-tensor**：整个张量共享一个 scale，实现简单，但易被少数离群值拉大范围；
@@ -1376,6 +1550,23 @@ LRU Metadata    用于缓存复用与淘汰
 
 复用的正确性要求 Token IDs、模型与版本、位置编码相关配置及影响 KV 的推理参数一致。还要防止跨租户错误共享带来的数据泄露和时序侧信道。
 
+**Redis 在 Prefix Cache 中存什么？** 通常不是把体积巨大的 KV Tensor 写入 Redis。KV Block 仍放在 vLLM 实例的 GPU/CPU Cache 中；Redis 更适合保存跨网关共享的**前缀索引与实例亲和性元数据**：
+
+```text
+prefix:{model_version}:{tenant}:{block_hash}
+  → instance_id / block_count / last_seen / expire_at
+```
+
+网关先对稳定前缀的 Token IDs 分块计算 Hash，再查询哪些健康实例已经缓存该前缀，优先将请求路由过去：
+
+```python
+prefix_key = hash(model_version, tenant_id, stable_prefix_token_ids)
+cached_instances = redis.smembers(f"prefix:{prefix_key}")
+backend = router.pick_healthy(cached_instances) or router.pick_least_loaded()
+```
+
+Redis 解决的是“哪个副本可能命中”，真正是否命中仍由目标 vLLM 实例校验。元数据需要较短 TTL，并在实例摘流、模型重载或 Cache 淘汰后失效；否则只会产生一次错误亲和路由，不应影响推理正确性。
+
 ##### 3.6.5 LRU 淘汰与调度配合
 
 当空闲块不足时，优先淘汰引用计数为 0 且最久未使用的 Prefix Cache Block。正在被活跃序列引用的块不可淘汰。实现上需要保证「查找、增加引用、释放、淘汰」的并发一致性，并在压力较高时让 Admission Control 与 Scheduler 共同决定是等待、抢占还是拒绝新请求。
@@ -1425,6 +1616,16 @@ Request Guardrail: max_model_len、max_tokens、Tool Schema 大小
 
 网关在入队前用对应 tokenizer 统计输入 Token，并用申请的最大输出长度估计资源上界。已经无法在 SLO 内处理时尽早返回 429/503，比让请求在队列中长时间等待更可控。
 
+多网关副本下，限流计数不能只放在单机内存，否则同一租户可以把流量分散到不同网关绕过配额。Redis 常通过 Lua Script 原子地完成“读取水位、补充令牌、扣减令牌、设置 TTL”，实现共享的 Token Bucket：
+
+```text
+rate:{tenant}:{model}:rpm     请求令牌桶
+rate:{tenant}:{model}:tpm     Token 令牌桶
+active:{tenant}:{model}       当前并发数（带租约/过期时间）
+```
+
+一次请求应同时申请 RPM、预估 TPM 和并发额度；任意一项不足就整体拒绝或回滚。仅用 `INCR` 再 `EXPIRE` 的多个命令会有并发窗口，Lua 或事务的意义是让检查与扣减成为一个原子操作。
+
 ##### 3.7.3 超时、重试与幂等
 
 一个流式请求需要分开三种超时：
@@ -1436,6 +1637,26 @@ Request Guardrail: max_model_len、max_tokens、Tool Schema 大小
 不能给整个 SSE 请求设一个简单的短超时，否则长回答会被误杀。重试只在「操作幂等 + 总预算未耗尽」时发生，采用指数退避和 jitter，并遵守 `Retry-After`。
 
 首 Token 返回前，纯生成请求可重试到其他实例；首 Token 已返回后，新实例没有原请求的 KV Cache，也不保证重新生成与已输出内容一致，通常只能终止流并返回显式错误。
+
+网关实现的关键是把“能否重试”绑定到流状态和总时间预算，而不是只根据异常类型判断：
+
+```python
+async def stream_with_failover(request, deadline):
+    emitted = False
+    for backend in router.healthy_candidates(request.model):
+        try:
+            async for chunk in backend.stream(request, deadline=deadline):
+                emitted = True
+                yield chunk
+            return
+        except RetryableError:
+            if emitted or time.monotonic() >= deadline:
+                raise StreamInterrupted()
+            circuit_breaker.record_failure(backend)
+    raise ServiceUnavailable()
+```
+
+实际系统还要传递 cancellation、限制最大尝试次数并使用 request ID 做审计；核心边界始终是：一旦已向客户端输出 Token，就不能静默换实例重新生成。
 
 ##### 3.7.4 熔断、降级、健康检查与异常切流
 
@@ -1469,6 +1690,17 @@ T_failover
 要稳定控制在 30 秒内，不能只把 health-check interval 设为 30 秒，而是要对检测、判定、传播和重路由分别设定预算并演练。
 
 **熔断**保护下游和网关自身；**降级**则在容量或模型不可用时保留有限服务。备用模型必须事先声明 capability，如上下文长度、Tool Calling、JSON Schema 和多模态能力；否则「有响应」不等于「服务可用」。
+
+Redis 也可以保存网关副本间共享的熔断状态，例如：
+
+```text
+circuit:{model}:{instance}
+  → state=open, failures=12, opened_at=..., probe_owner=...
+```
+
+每个网关先在本地快速判断，失败统计和 `open/half-open` 状态再同步到 Redis，避免某个网关已经熔断、其他网关仍持续把请求打向故障实例。半开阶段可用 `SET key value NX EX ...` 抢占少量探测权，防止所有网关同时探测造成流量尖峰。
+
+Redis 本身也可能故障，所以它不应成为推理链路的单点：限流可按安全策略选择短时本地保守额度或 fail-closed；熔断应继续依赖本地状态和健康检查；Prefix 元数据不可用时则退化为普通负载路由，只损失命中率，不影响请求正确性。
 
 ##### 3.7.5 99.99% 可用性如何定义
 
@@ -1531,6 +1763,22 @@ step 3: C 结束 → [B, D, E]
 完成的序列立即离开，新请求可在下一轮加入，避免 GPU 等待最长序列。调度单位本质上是 Token 预算，Scheduler 在 Prefill 和 Decode 之间分配当轮算力。
 
 它提高的是吞吐和 GPU 利用率，但 batch 过大时单请求 TPOT 与尾延迟会上升，因此仍是吞吐与延迟的取舍。
+
+Continuous Batching 可以抽象为一个逐轮重排的调度循环：
+
+```python
+while waiting or running:
+    budget = max_batched_tokens
+    batch = select_decode_requests(running, budget)   # 先保护在线 TPOT
+    budget -= token_cost(batch)
+    batch += select_prefill_chunks(waiting, budget)  # 剩余预算接纳新请求
+
+    outputs = model_executor.step(batch)
+    running, finished = update_sequences(running, outputs)
+    release_blocks(finished)
+```
+
+真实 vLLM 的实现远比这段伪代码复杂，但核心决策已经显现：每轮在 Decode、Prefill 和 KV Block 之间分配预算；完成序列及时退出，新请求不必等待旧 batch 全部结束。
 
 ##### 3.8.2 PagedAttention
 
