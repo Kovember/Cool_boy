@@ -1167,7 +1167,7 @@ $$
 r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\text{old}}(a_t|s_t)}
 $$
 
-如果优势 $A_t>0$，说明该动作值得提高概率；如果 $A_t<0$，则应降低概率。PPO 不允许这个概率比在一次更新中变化过大，而是最大化裁剪后的策略目标：
+如果优势 $`A_t > 0`$，说明该动作值得提高概率；如果 $`A_t < 0`$，则应降低概率。PPO 不允许概率比 $`r_t(\theta)`$ 在一次更新中偏离 1 太远，因此使用裁剪后的策略目标：
 
 $$
 L_{clip}=\mathbb{E}_t\left[\min\left(r_tA_t,\ \operatorname{clip}(r_t,1-\epsilon,1+\epsilon)A_t\right)\right]
