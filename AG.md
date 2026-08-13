@@ -94,21 +94,7 @@ Harness Engineering 进一步处理模型调用之外的问题：
 
 因此，三者不是相互替代，而是逐层扩展：
 
-```mermaid
-flowchart LR
-    P["Prompt Engineering<br/>指令 · 示例 · 输出格式<br/>让模型理解任务"]
-    C["Context Engineering<br/>RAG · Memory · 压缩 · 预算<br/>让模型看到正确信息"]
-    H["Harness Engineering<br/>Runtime · Tool · State · Sandbox<br/>让模型可靠地行动"]
-
-    P -->|"增加信息"| C -->|"增加执行与治理"| H
-
-    classDef prompt fill:#EEF2FF,stroke:#6366F1,color:#312E81,stroke-width:1.5px;
-    classDef context fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.5px;
-    classDef harness fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:2px;
-    class P prompt;
-    class C context;
-    class H harness;
-```
+![Prompt Engineering 到 Harness Engineering 的能力演进](figures/prompt-context-harness-evolution.png)
 
 | 阶段 | 核心问题 | 主要机制 | 仍未解决的问题 |
 |---|---|---|---|
@@ -139,50 +125,21 @@ Workspace & Sandbox
 Task Orchestration
 ```
 
-```mermaid
-flowchart LR
-    U["用户 / 业务系统"]
-    CB["Context Builder<br/>组装本轮模型输入"]
-    RT["Agent Runtime<br/>状态 · 控制 · 预算"]
-    LOOP["ReAct Loop<br/>Model ⇄ Tool"]
-    OUT["最终输出"]
-
-    U --> CB --> RT --> LOOP --> OUT
-
-    STATE[("Thread State<br/>Event · Checkpoint")]
-    KNOW[("Memory / RAG")]
-    TOOL["Tool Executor<br/>Local · MCP · Subagent"]
-    OBS["Trace / Metric / Audit"]
-
-    STATE -.-> CB
-    KNOW -.-> CB
-    RT -.-> STATE
-    LOOP <--> TOOL
-    RT -.-> OBS
-
-    classDef core fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
-    classDef control fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
-    classDef store fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.4px;
-    classDef external fill:#F8FAFC,stroke:#64748B,color:#1E293B,stroke-width:1.2px;
-    class RT,CB control;
-    class LOOP core;
-    class STATE,KNOW store;
-    class U,OUT,TOOL,OBS external;
-```
+![Agent Harness 总体架构](figures/agent-harness-architecture.png)
 
 最基本的架构原则是：
 
 ```text
-Harness
-  ↓
-Agent Runtime
-  ↓
-ReAct Loop
-  ↓
-Model / Tool
+Agent Harness
+  ├─ Agent Runtime / ReAct Loop
+  ├─ Context、State、Memory
+  ├─ Tool Executor、Policy、Sandbox
+  └─ Observability、Error Recovery
+
+Agent Runtime / ReAct Loop：Model Call ⇄ Tool Call / Tool Result
 ```
 
-而不是让 ReAct Loop 直接包含所有业务能力：
+也就是说，Runtime 就是循环的驱动器；Harness 则是除模型推理能力之外，支撑并约束整个循环的工程系统。不要让 Runtime 直接耦合每一种 Harness 机制：
 
 ```python
 # 不推荐：让 Loop 知道每一种 Harness 机制
@@ -641,28 +598,9 @@ thread_id → run_id → turn_id → span_id
 
 Tool-call 是模型作用于外部世界的统一通道。无论底层是 Python 函数、Shell、浏览器、MCP Server，还是 Thread 内的 Goal / Plan 状态工具，Memory 召回和写入，对 ReAct Loop 都应表现为统一的 Tool Call / Tool Response 协议。
 
-```mermaid
-flowchart LR
-    M["Model"]
-    FC["Function Calling<br/>模型输出结构化动作"]
-    H["Harness<br/>校验 · 权限 · 路由 · 归一化"]
-    T["Tool<br/>Local Tool 或 MCP Server"]
+![Tool-use 生态：Function Calling、Skill 与 MCP](figures/tool-use-ecosystem.png)
 
-    M -->|"Tool Call"| FC --> H -->|"执行"| T
-    T -->|"Tool Result"| H -->|"归一化结果"| M
-
-    SKILL["Skill<br/>按需加载指令、流程与资源"]
-    SKILL -.-> H
-
-    classDef model fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
-    classDef harness fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
-    classDef protocol fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.4px;
-    classDef capability fill:#F8FAFC,stroke:#64748B,color:#1E293B,stroke-width:1.2px;
-    class M model;
-    class H harness;
-    class FC protocol;
-    class T,SKILL capability;
-```
+这里要区分三个层次：**Function Calling 是模型表达动作的协议，Harness 是解释并执行动作的运行时，Skill 是由 Harness 按需读取并回填给模型的能力说明**。Skill 不是绕过 Function Calling 独立注入模型；通常先由模型发起读取 Skill 的 Function Call，获得逐步披露的指令与资源，再据此发起后续 Function Call。这样既避免一次加载全部 Skill 占满上下文，也让每一次读取和执行都经过同一套权限、审计与异常处理。
 
 ## 3.1 Tool 的本质
 

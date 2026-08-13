@@ -1161,14 +1161,30 @@ PPO 是在线 RL 算法，它将奖励模型作为环境，通过交互式采样
 1. **采样**：从当前策略 $`\pi_\theta`$ 中采样一批 prompt 并生成回答。
 2. **打分**：用奖励模型计算每个回答的奖励 $`r(x,y)`$。
 3. **优势估计**：使用 GAE（Generalized Advantage Estimation）计算每个 token 的优势函数 $`A_t`$，通常需要一个 critic 模型（价值网络）来估计状态价值。
-4. **策略更新**：最大化目标函数
+4. **策略更新**：先计算新旧策略对同一动作的概率比：
 
 $$
-\mathcal{L}_{\text{PPO}} = \mathbb{E} \left[ \min\left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)} A, \ \text{clip}\left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}, 1-\epsilon, 1+\epsilon \right) A \right) \right]
+r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\text{old}}(a_t|s_t)}
 $$
 
-   同时加入 KL 散度惩罚项，防止策略偏离参考策略（通常是 SFT 模型）太远。
-5. **价值更新**：更新 critic 网络，减小价值估计误差。
+如果优势 $A_t>0$，说明该动作值得提高概率；如果 $A_t<0$，则应降低概率。PPO 不允许这个概率比在一次更新中变化过大，而是最大化裁剪后的策略目标：
+
+$$
+L_{clip}=\mathbb{E}_t\left[\min\left(r_tA_t,\ \operatorname{clip}(r_t,1-\epsilon,1+\epsilon)A_t\right)\right]
+$$
+
+`clip` 将有效更新限制在旧策略附近，避免少量高优势样本让策略一步走得过远。实际训练还要同时考虑三部分：
+
+```text
+总目标 = 策略目标 L_clip
+       - 价值函数误差
+       - β × 与参考策略的 KL
+       + 熵奖励（可选）
+```
+
+其中 Critic 通过价值函数误差学习状态价值；KL 约束当前策略不要偏离参考策略（通常是 SFT 模型）太远；熵奖励用于避免策略过早变得确定。
+
+5. **价值更新**：更新 Critic，改善后续 GAE 的优势估计。
 
 **优点**：训练稳定，通过 KL 约束保留了 SFT 模型的生成能力；能充分利用奖励模型。
 **缺点**：需要同时维护四个模型（actor, critic, reference, reward），显存占用大，实现复杂。
@@ -1246,19 +1262,28 @@ $$
 在自回归生成时，每一步需要计算当前 token 与之前所有 token 的注意力。如果每次都重新计算所有历史 token 的 K 和 V，会引入大量重复计算。KV Cache 将已生成的 token 的 K、V 缓存在内存中，新 token 只需计算自己的 K、V，然后与缓存中的 K、V 拼接后进行注意力计算。
 
 **内存占用**
-KV Cache 的大小为：
+标准多头注意力下，整模型 KV Cache 的大小为：
 
 ```math
-\text{内存} = 2 \times \text{batch\_size} \times \text{num\_heads} \times \text{seq\_len} \times \text{head\_dim} \times \text{sizeof(dtype)}
+\text{内存} = 2 \times \text{num\_layers} \times \text{batch\_size} \times \text{num\_kv\_heads} \times \text{seq\_len} \times \text{head\_dim} \times \text{sizeof(dtype)}
 ```
 
-例如，Llama 2 7B（32 heads，head_dim=128）使用 FP16，batch=1，seq_len=4096 时，KV Cache 约
+系数 2 对应 Key 和 Value。使用 GQA/MQA 时应代入 `num_kv_heads`，而不是 Query Head 数。
+
+例如，Llama 2 7B 有 32 层、32 个 KV Head，`head_dim=128`。使用 FP16、`batch=1`、`seq_len=4096` 时，**单层** KV Cache 为：
 
 $$
-2 \times 1 \times 32 \times 4096 \times 128 \times 2 \text{ bytes} = 2 \times 32 \times 4096 \times 256 \text{ bytes} = 2 \times 32 \times 1,048,576 \text{ bytes} = 67,108,864 \text{ bytes} \approx 64 \text{ MB}
+2 \times 1 \times 32 \times 4096 \times 128 \times 2\text{ bytes}
+=64\text{ MiB}
 $$
 
-当 seq_len 达到 32k 时，占用约 512 MB，对于大 batch 或多头模型，KV Cache 会成为显存瓶颈。
+乘以 32 层后，整模型约为：
+
+$$
+32\times64\text{ MiB}=2048\text{ MiB}=2\text{ GiB}
+$$
+
+当上下文从 4k 增加到 32k 时，KV Cache 线性扩大 8 倍，单请求约占 16 GiB。再叠加 Batch 和并发序列后，KV Cache 很容易超过模型权重之外的剩余显存。
 
 **优化技巧**
 - **MQA（Multi-Query Attention）**：所有注意力头共享同一组 K、V，将 KV Cache 大小减少到原来的 $`1/\text{num\_heads}`$，但可能影响模型质量。
@@ -1704,13 +1729,9 @@ Redis 本身也可能故障，所以它不应成为推理链路的单点：限�
 
 ##### 3.7.5 99.99% 可用性如何定义
 
-99.99% 意味着一年理论不可用时间约为：
+99.99% 意味着一年理论不可用时间约为 52.56 分钟。但可用性数字只有在 SLI 统计口径明确后才有意义。
 
-$$
-365 \times 24 \times 60 \times (1 - 0.9999) \approx 52.56\text{ 分钟}
-$$
-
-但可用性必须先给出 SLI 口径。一个实用定义是：
+一个实用定义是：
 
 $$
 Availability = \frac{Valid\ Requests - Gateway\ Attributed\ Failures}{Valid\ Requests}
