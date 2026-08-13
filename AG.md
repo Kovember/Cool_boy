@@ -1497,26 +1497,35 @@ Memory 不是 Context 的同义词，也不是脱离 Thread 的“第二个大�
 > **Memory 属于用户级全局持久化数据，可以跨 Thread 复用；Goal、Plan、Task 属于单个 Thread 的 Durable State。模型通过 Tool-call 访问 User Memory（如`memory_search` 和 `memory_write`），Context Builder 也可以在模型调用前自动检索 Memory。**
 
 ```mermaid
-flowchart LR
-    STORE["User Memory Store<br/>Preference · Semantic<br/>Decision · Procedure"]
-    TURN["当前任务<br/>User Input + Thread State"]
-    QUERY["Query Construction<br/>目标 · 实体 · 约束"]
-    RETRIEVE["Hybrid Retrieval<br/>关键词 + 向量 + 过滤"]
-    RANK["Rerank<br/>去重 · 新鲜度 · 置信度"]
-    CB["Context Builder<br/>按预算选择 Memory"]
-    MODEL["Model"]
+flowchart TB
+    subgraph PASSIVE["被动路径：模型调用前自动注入"]
+        direction LR
+        INPUT1["当前任务"] --> CB["Context Builder"]
+        CB --> STORE1[("User Memory")]
+        STORE1 --> SELECT["检索与筛选"]
+        SELECT --> CTX["Model Context"]
+        CTX --> MODEL1["Model"]
+    end
 
-    TURN --> QUERY --> RETRIEVE --> RANK --> CB --> MODEL
-    STORE -.-> RETRIEVE
+    subgraph ACTIVE["主动路径：模型推理中按需查询"]
+        direction LR
+        MODEL2["Model"] --> CALL["memory_search"]
+        CALL --> TOOL["Harness / Memory Tool"]
+        TOOL --> STORE2[("User Memory")]
+        STORE2 --> RESULT["Tool Result"]
+        RESULT --> MODEL2
+    end
+
+    MODEL1 ~~~ MODEL2
 
     classDef store fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.4px;
     classDef process fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.4px;
     classDef context fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
     classDef model fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
-    class STORE store;
-    class QUERY,RETRIEVE,RANK process;
-    class TURN,CB context;
-    class MODEL model;
+    class STORE1,STORE2 store;
+    class SELECT,CALL,RESULT process;
+    class INPUT1,CB,CTX,TOOL context;
+    class MODEL1,MODEL2 model;
 ```
 
 Memory 有两条访问路径：
