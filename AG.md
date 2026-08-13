@@ -426,16 +426,14 @@ Memory、Plan、Checkpoint 和 Subagent 都不应写成 ReAct Loop 中的特殊�
 
 **源码对照：** Pi 的 [`agent-loop.ts`](https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent-loop.ts) 和 [`packages/agent/README.md`](https://github.com/earendil-works/pi/blob/main/packages/agent/README.md)。
 
-## 2.3 Runtime State 与执行控制
+## 2.3 Runtime State
 
 ReAct Loop 是执行算法，但 Runtime 还需要记录当前执行正在发生什么，例如：
 
 ```text
 当前是否正在调用模型
 哪些 Tool Call 正在执行
-用户是否发送了 Steering
-是否存在 Follow-up
-是否收到 Abort
+等待处理的控制事件
 消耗了多少 Token、时间和预算
 ```
 
@@ -447,58 +445,38 @@ class RuntimeState:
     phase: str = "idle"
     active_turn_id: str | None = None
     inflight_tool_calls: set[str] = field(default_factory=set)
-    steering_queue: list[Message] = field(default_factory=list)
-    follow_up_queue: list[Message] = field(default_factory=list)
-    abort_requested: bool = False
+    control_queue: list[ControlEvent] = field(default_factory=list)
     model_tokens: int = 0
 ```
 
 这些状态属于 **Ephemeral Runtime State**，主要服务于当前进程。进程重启后，可以根据 Thread、Event 和 Checkpoint 重新构建，而不必逐字段持久化。
 
-### Steering
-
-Steering 是用户对当前执行方向的修正：
-
-```text
-先不要修改文件，重新检查问题根因。
-```
-
-已经发送出去的模型请求无法被修改，因此 Steering 通常进入队列，在一个 Model Call 或 Tool Batch 完成后注入下一轮 Context。
-
-### Follow-up
-
-Follow-up 是当前任务结束后需要继续完成的请求：
-
-```text
-完成修复后，再生成一份面向 Reviewer 的变更说明。
-```
-
-Steering 修改当前执行方向，Follow-up 则在当前任务准备结束时触发后续工作。
-
-### Abort
-
-Abort 必须沿整个执行链传播：
-
-```text
-Runtime
-→ Model Request
-→ Tool Executor
-→ Shell Process
-→ Network Request
-→ Child Agent
-```
-
-只终止模型请求而不终止工具、Shell 命令和子 Agent，可能出现界面已经停止，但后台任务仍在继续运行的问题。
-
-因此可以概括为：
-
-> ReAct Loop 负责 Model–Tool 循环，Agent Runtime 则在其外部管理执行状态、控制消息、资源统计和取消传播。
+Runtime State 只描述当前执行快照；Pause、Abort、Steering 等不会直接修改这些字段，而是先成为控制事件，再由状态机决定何时以及如何生效。
 
 ---
 
-## 2.4 Agent Loop 状态机
+## 2.4 Agent Loop 状态机与可控性
 
-最小 ReAct Loop 只需要「调用模型—执行工具—追加结果」，但生产系统必须显式管理每个阶段。一个可实现的状态集合如下：
+最小 ReAct Loop 只需要「调用模型—执行工具—追加结果」，但生产系统还要响应暂停、终止、转向、审批和预算限制。它们不是状态机之外的另一套机制，而是驱动同一状态机迁移的**控制事件**。
+
+数据事件推进正常 Model–Tool 链路，控制事件改变链路如何继续：
+
+| 控制事件 | 生效边界 | 状态机行为 |
+|---|---|---|
+| Abort | 立即发出取消，随后清理 | 任意活动状态 → `ABORTING` → `SETTLING` → `ABORTED` |
+| Pause | Model Call 或 Tool 原子操作后的安全点 | `PAUSING` → `PAUSED`，Resume 后回到可恢复状态 |
+| Approval | 高风险 Tool 执行前 | `WAITING_APPROVAL`，批准后重新校验并执行，拒绝则记录结果 |
+| Steering | 当前 Model Call/Tool Batch 完成后 | 进入下一次 Context Build，修改后续方向，不篡改已发出的调用 |
+| Follow-up | 当前 Run 正常收尾后 | 建立后续 Turn/Run，不插入当前原子操作 |
+| Budget Exceeded | 每次状态迁移前后 | 终止、降级或请求外部决策 |
+
+控制优先级通常为：
+
+```text
+Abort > Security Revocation > Pause > Approval > Steering > Follow-up
+```
+
+状态集合可以实现为：
 
 ```text
 IDLE
@@ -532,6 +510,8 @@ def transition(state, event):
     return next_state
 ```
 
+`transition` 先按优先级消费 Control Queue，再处理普通数据事件。副作用由 Effect Queue 异步执行；执行结果再以事件回到状态机，避免状态迁移函数直接调用模型、网络或工具。
+
 关键原则：
 
 - **单写者**：同一 Run 的状态只由一个执行器推进，通过 lease 或 compare-and-swap 防止双重执行；
@@ -539,6 +519,8 @@ def transition(state, event):
 - **稳定检查点**：在模型调用完成、工具执行前后和轮次结束处持久化 Checkpoint；
 - **恢复靠重放**：进程重启后从最后 Checkpoint 加载，重放后续事件，不持久化 socket、future 等进程内对象；
 - **副作用幂等**：为写操作生成 `idempotency_key`，记录 `started/completed/unknown` 及外部资源 ID。
+- **取消传播**：AbortSignal 必须覆盖模型流、Tool Executor、Shell 子进程、网络请求和 Subagent，随后等待资源清理；只停模型会留下后台副作用；
+- **收敛保护**：维护重复 Tool Call 指纹、连续无进展次数和剩余轮数、Token、金额、时间、工具调用与 Subagent 深度，达到阈值时停止或降级。
 
 **常见问题**
 
@@ -547,23 +529,10 @@ def transition(state, event):
 2. **Tool 已成功，但结果未落库时进程崩溃，如何恢复？**
    依据幂等键或外部资源 ID 查询真实结果，不直接重放写操作。
 
-## 2.5 可控性：控制面与数据面分离
+3. **Steering 为什么不能立即改写正在执行的 Model Call？**
+   已发出的请求拥有冻结 Context；Steering 应在安全边界进入下一轮 Context，否则运行记录不可复现，也可能与正在执行的 Tool Call 冲突。
 
-数据面执行 Model Call 和 Tool Call；控制面处理 Pause、Resume、Abort、Steering、Follow-up、Approval 和预算。控制信号需要有优先级：
-
-```text
-Abort > Security Revocation > Pause > Steering > Follow-up
-```
-
-- **Abort** 需通过结构化并发传播到模型流、Tool Executor、子进程和 Subagent，最终等待资源清理完成；
-- **Pause** 只在安全点生效，不应在外部事务执行一半时冻结；
-- **Steering** 作为高优先级用户消息进入下一次 Context Build，但不篡改已发出的 Tool Call；
-- **Approval** 携带工具名、参数摘要、风险、资源范围和过期时间，批准后仍要再校验调用是否未被篡改；
-- **Budget** 同时限制轮数、Token、金额、墙钟时间、工具次数、并发数和 Subagent 深度。
-
-每轮都应检查「是否还在向 Goal 收敛」。可以维护重复 Tool Call 指纹、连续无进展次数和剩余预算，达到阈值时强制停止、改用 fallback 或请求外部决策。
-
-## 2.6 可观测性：Event、Trace、Metric 与 Replay
+## 2.5 可观测性：Event、Trace、Metric 与 Replay
 
 可观测性不是只记 Prompt 和 Response。建议统一关联字段：
 
