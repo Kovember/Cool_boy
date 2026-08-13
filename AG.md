@@ -1055,235 +1055,37 @@ Context Engineering 解决的核心问题是：
 
 Context 不是持久状态本身，而是 Harness 从各类状态与数据源中构建出的**本轮模型输入**。
 
-## 4.1 状态与 Context 的边界
+## 4.1 Context Builder：从状态构造本轮输入
 
-常用概念如下：
-
-| 概念          | 含义                                                 |
-| ------------- | ---------------------------------------------------- |
-| Thread        | 一条持久、可恢复的任务执行链                         |
-| Turn / Run    | 一次用户输入触发的完整 Agent 执行                    |
-| Event / Item  | Message、Tool Call、Tool Result、Approval 等原子事件 |
-| Runtime State | 当前进程中的瞬时执行状态                             |
-| Checkpoint    | Thread 在稳定边界上的可恢复快照                      |
-| User Memory   | 用户级、跨 Thread 复用的长期知识                     |
-
-其中，Thread 内通常保存：
+Thread、Memory、Workspace 和检索结果是持久状态或外部数据，Context 只是模型本轮看到的快照。Context Builder 负责：
 
 ```text
-Messages / Events
-Goal / Plan / Task
-Tool Ledger
-Workspace Revision
-Checkpoint Reference
+Thread State + User Memory + Environment / Retrieval
+                         ↓
+       Select → Deduplicate → Compress → Order → Budget
+                         ↓
+                 ModelInputContext
 ```
 
-User Memory 独立于 Thread，以 `user_id` 为边界存储。
+输入在 Model Call 前冻结，并记录消息、Tool Schema、Memory 引用、Goal/Plan 版本和 Workspace Revision，用于复现、审计与回放。外部检索内容属于不可信数据，不能覆盖 System Policy。
 
-二者都不会被完整发送给模型，而是先经过 Context Builder：
+## 4.2 上下文三层结构
+
+来源经过 Context Builder 选择后，最终模型输入更适合按**变化频率**分成三层：
+
+| 层次 | 典型内容 | 变化方式 | 处理策略 |
+|---|---|---|---|
+| 稳定层 | System/Developer 指令、固定 Tool Schema、Skill Metadata、长期有效约束 | 跨轮基本不变 | 原文保留、确定性序列化，形成可复用 Prefix |
+| 历史消息层 | 已封闭的旧对话、Tool Call/Result、阶段决策、旧检索证据 | 低频重写 | 主要压缩对象；分段摘要、Artifact 化，并冻结压缩版本 |
+| 最近轮次层 | 最近几轮对话、当前 Tool Result、最新用户输入和当轮检索 | 每轮追加或替换 | 尽量保留原文，保证局部推理、指代和纠错信息完整 |
 
 ```text
-Thread State          User Memory          Environment / Retrieval
-      \                    |                         /
-                       Context Builder
-                Select / Compress / Order
-                              ↓
-                    模型输入上下文
-                              ↓
-                       Model Request
+┌──────────────── 稳定层：长期不变，可持续命中 Prefix Cache
+├──────────────── 历史消息层：封闭后低频分段压缩
+└──────────────── 最近轮次层：保留原文，持续追加
 ```
 
-## 4.2 Context 的来源
-
-为了便于理解，可以把 Context 分成四层。
-
-### 1. Control Context
-
-```text
-System / Developer Instructions
-安全规则与输出协议
-Tool Description + Schema
-Available Skill Metadata
-Active Skill Instructions
-```
-
-这部分定义模型必须遵守什么，以及可以执行哪些动作。
-
-### 2. Thread Context
-
-```text
-当前用户输入
-最近的对话与 Event
-Goal / Plan / Current Task
-最近的 Tool Result
-```
-
-这部分保证同一任务可以持续执行。
-
-### 3. User Memory Context
-
-```text
-用户偏好
-稳定背景信息
-跨 Thread 的历史决策
-可复用的执行经验
-```
-
-Memory Retriever 只召回与当前任务相关的少量内容，而不是把整个 Memory Store 注入模型。
-
-### 4. Environment and Retrieved Context
-
-```text
-Workspace 状态
-Git Revision 与文件变更
-RAG 文档片段
-Web / MCP / Database Result
-Subagent Result
-```
-
-这部分描述当前外部环境和检索到的证据。外部内容通常属于不可信数据，不能覆盖 System Policy。
-
-## 4.3 从 Prefill 与 KV Cache 看 Context 设计
-
-模型推理可以简单分为：
-
-```text
-Prefill
-    处理输入 Context，并建立 KV Cache
-
-Decode
-    基于 KV Cache 逐 Token 生成
-```
-
-长 Context 会增加 Prefill 延迟。若多轮请求拥有相同的 Token 前缀，推理系统通常可以复用 Prefix KV Cache。
-
-因此，Context 应尽量采用：
-
-```text
-稳定前缀 + 追加历史 + 动态尾部
-```
-
-例如：
-
-```text
-System Prompt
-固定 Tool / Skill Metadata
-历史 Message 与 Tool Result
-Goal / Plan / Task
-本轮 Memory / RAG
-最新用户输入
-```
-
-需要注意：
-
-- **保持稳定内容顺序固定**：Tool Schema、Skill Metadata 不要每轮随机排序。
-- **使用确定性序列化**：相同对象应生成完全一致的文本和 JSON 字段顺序。
-- **采用追加式历史**：尽量在已有 Context 后追加 Message，而不是频繁重写前面的内容。
-- **把动态检索结果放在后部**：Memory、RAG 和实时 Workspace 状态变化频繁，不应破坏稳定前缀。
-
-这样既能减少 Prefill 成本，也能提高 Prompt Cache 或 Prefix Cache 的命中率。
-
-## 4.4 Context Builder 与 模型输入上下文
-
-Context Builder 负责把不同来源的信息组织成一次模型请求：
-
-```text
-Collect
-→ Filter
-→ Select
-→ Deduplicate
-→ Compress
-→ Order
-→ Token Budget
-→ Freeze Input
-```
-
-简化实现如下：
-
-```python
-async def build_context(thread_id, user_input, token_budget):
-    thread = await thread_store.load(thread_id)
-
-    memories = await memory_retriever.search(
-        query=make_memory_query(turn_input, thread),
-        top_k=8,
-    )
-
-    sections = [
-        control_context(thread),
-        thread_context(thread),
-        memory_context(memories),
-        environment_context(thread),
-        user_input,
-    ]
-
-    context = fit_token_budget(sections, token_budget)
-
-    return ModelInputContext(
-        thread_id=thread.id,
-        turn_id=thread.current_turn_id,
-        messages=tuple(context.messages),
-        tool_schemas=tuple(context.tool_schemas),
-        memory_refs=tuple(m.ref for m in memories),
-        goal_version=thread.goal.version,
-        plan_version=thread.plan.version,
-        workspace_revision=thread.workspace_revision,
-    )
-```
-
-Context Builder 的重点不是简单拼接，而是决定：
-
-```text
-哪些内容需要进入模型
-哪些内容应该被压缩
-哪些内容优先级更高
-哪些内容不能进入当前 Context
-```
-
-在模型请求发出前，Harness 会将结果冻结为 `ModelInputContext`。冻结后的输入表示模型在这一轮真正看到的内容，包括：
-
-```text
-Messages
-Tool Schemas
-召回的 Memory Reference
-Goal / Plan Version
-Workspace Revision
-```
-
-即使 Thread、Memory 或 Workspace 随后发生变化，也不会影响已经发出的模型请求。
-
-因此，冻结模型输入可以支持：
-
-```text
-复现：使用相同输入重新运行
-调试：检查模型当时看到了什么
-审计：记录哪些数据进入模型
-回放：恢复一次具体模型调用
-对比：让不同模型处理相同输入
-```
-
-可以将完整关系概括为：
-
-```text
-Thread / Memory / Environment
-            ↓
-      Context Builder
-            ↓
-     模型输入上下文
-            ↓
-       Model Request
-```
-
-## 4.5 上下文分层与预算
-
-面向模型的输入可以分为四层，每层有不同保留策略：
-
-| 层次 | 内容 | 优先级 | 处理策略 |
-|---|---|---:|---|
-| 系统指令 | 身份、安全、全局约束 | P0 | 原文保留、稳定前缀 |
-| 工具信息 | 当前可用 Tool/Skill Schema | P0/P1 | 只注入可用集，保持稳定顺序 |
-| 消息历史 | 对话、Tool Call/Result、决策 | P1/P2 | 保留近期原文，较旧内容分段压缩 |
-| 检索信息 | RAG、Memory、Workspace、Artifact | P1/P3 | 按当前任务检索，设 TTL 与引用 |
+三层是模型输入的**物理布局**，前面的四类是信息的**逻辑来源**。例如 RAG 结果首次出现时属于最近轮次层；任务继续推进后，有价值的结论进入历史消息层，原文则转存 Artifact；真正长期稳定的用户事实也可以沉淀到 Memory，但不会因此自动塞进稳定前缀。
 
 窗口预算不能用字符数估算，必须使用目标模型 Tokenizer，并预留输出、Tool Schema 变化和 safety margin：
 
@@ -1296,11 +1098,13 @@ input_budget = context_window
 
 对过大 Tool Result，原文写入 Artifact Store，Context 中仅保留结构化摘要、关键证据和可再读取的 artifact ID，避免每轮重复携带。
 
-## 4.6 Context Compression
+## 4.3 Context Compression
 
-长任务不能无限追加全部历史。常见做法包括：
+长任务不能无限追加全部历史。压缩的主要目标是三层中的**历史消息层**，不是平均裁剪整个 Context：
 
-- 最近对话保留原文，早期历史压缩为 Summary；
+- 稳定层保持字节与顺序不变，避免破坏长期约束和 Prefix Cache；
+- 最近轮次层保留原文，避免丢失指代关系、最新反馈和工具交互细节；
+- 已封闭的历史消息分段压缩为 Summary；
 - 超长 Tool Result 只保留摘要和 Artifact 引用；
 - 去除重复日志、过期 Plan 和重复文件片段；
 - Subagent 只返回结论、Evidence 和未解决问题；
@@ -1310,7 +1114,7 @@ input_budget = context_window
 
 > 保留任务目标、关键决策、当前状态和必要证据，压缩重复过程与低价值中间信息。
 
-### 4.6.1 水位触发与结构化摘要
+### 4.3.1 水位触发与结构化摘要
 
 压缩应由水位触发，而不是每轮都重写历史。可设置两级阈值：
 
@@ -1332,16 +1136,16 @@ artifacts: 可再读取的外部内容引用
 
 压缩后必须做不变式检查：系统约束是否仍存在、Goal 是否一致、所有未完成 Tool Call 是否有状态、关键结论是否能追溯到证据。摘要应带版本和覆盖的 Event 范围，避免重复压缩产生漂移。
 
-## 4.7 Context Compression 与 Prefix Cache 的协同
+## 4.4 Context Compression 与 Prefix Cache 的协同
 
-冲突的根源是：压缩会重写前面的 Token，而 Prefix Cache 要求从第一个 Token 开始的前缀完全一致。解法不是放弃压缩，而是让「稳定区」和「可变区」分离：
+冲突的根源是：历史压缩会改写 Token，而 Prefix Cache 只能复用从开头连续一致的 Token。若每轮都重新总结整段会话，摘要后面的 Token 即使没有变化，也会因前缀断裂而全部失去命中。
+
+解法不是放弃压缩，而是让三层承担不同职责：稳定层永不因历史压缩而变化；历史消息层只在越过水位后低频生成新版本；最近轮次层保持原文并持续追加。
 
 ```text
-[稳定系统指令]
-[稳定 Tool/Skill 目录]
-[版本化的压缩摘要]
-[压缩后新增的完整消息]
-[当轮动态检索内容]
+[稳定层：System + Tool/Skill Metadata]       ← 长期命中
+[历史层：summary_vN + 未压缩的封闭片段]      ← 低频变化
+[最近层：最近几轮 + 当前 Tool/RAG + 新输入]  ← 高频追加
 ```
 
 具体策略：
@@ -1349,23 +1153,25 @@ artifacts: 可再读取的外部内容引用
 1. **前缀不变性**：系统指令、Tool Schema 的字节内容和排序都要确定，不注入时间戳、随机 ID 等动态字段；
 2. **分段压缩**：只压缩一个已封闭的旧历史段，不每轮重新摘要整段会话；
 3. **摘要冻结**：生成 `summary_vN` 后保持不变，直到下一次跨越 hard waterline 才生成 `summary_vN+1`；
-4. **块级 Cache**：若 Serving 支持 block-aware prefix caching，新摘要只会使失效点之后的 Block 重算，稳定系统前缀仍可复用；
+4. **块级 Cache**：新摘要会使变化点之后的 KV 失效，但 PagedAttention + vLLM APC 仍可保留和复用变化点之前的完整稳定 Block；
 5. **低频压缩**：使用水位和滞回区间，例如超过 80% 时压到 55%，避免在阈值附近每轮抖动；
 6. **按实测优化**：同时记录 compression latency、压缩后输入 Token、prefix cached tokens 和任务质量，而不是只追求命中率。
 
-最终目标是让大部分轮次只在尾部追加 Token，在必须压缩时仅付出一次局部 Cache Miss，换取后续多轮的稳定复用。
+PagedAttention 为 KV Block 的独立保留、引用和回收提供存储基础，vLLM APC 则用 Block Hash 查找可复用前缀。例如压缩前为 `Stable + H1 + H2 + Recent`，压缩后变为 `Stable + summary_v1 + Recent`：第一次压缩后，APC 仍可复用 `Stable`；`summary_v1` 冻结后，后续轮次又能复用 `Stable + summary_v1`。变化后的摘要与旧历史 Token 不同，其 KV 仍须重新计算。
+
+最终目标不是让压缩永远不产生 Cache Miss，而是让大部分轮次只在最近层追加；跨越水位时只改写历史层并承担一次局部重算，随后冻结新摘要，重新建立可持续命中的前缀。
 
 **常见问题**
 
 1. **为什么 Context 不是越多越好？**
    过多内容会增加 Prefill 延迟，并带来注意力稀释、信息重复和指令冲突。
 2. **压缩与 Prefix Cache 的根本冲突是什么？**
-   压缩会重写历史 Token，而 Prefix Cache 要求从首 Token 开始的前缀一致。因此要固定稳定前缀，对封闭历史低频分段压缩，并冻结摘要多轮复用。
+   压缩会重写历史 Token，而 Prefix Cache 只能复用从首 Token 开始连续一致的部分。因此稳定层必须固定，主要压缩封闭的历史消息层，最近轮次保留原文；摘要生成后再冻结多轮复用。
 3. **怎么评估压缩方案？**
    同时看任务成功率、关键事实保留率、压缩延迟、输入 Token 和 cached tokens，不能只看压缩比。
 
 
-## 4.8 RAG：从全量知识到有限 Context
+## 4.5 RAG：从全量知识到有限 Context
 
 RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 内，尽可能找到支持当前任务的证据。一条完整链路包含：
 
@@ -1379,7 +1185,7 @@ RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 
        → 生成与引用
 ```
 
-### 4.8.1 文档处理与分块
+### 4.5.1 文档处理与分块
 
 分块决定了检索的最小语义单元。块太小，召回内容缺少上下文；块太大，Embedding 主题被稀释，也会浪费 Context。
 
@@ -1392,7 +1198,7 @@ RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 
 
 对层级知识，只索引叶子名称往往不够。例如「正弦定理」在不同学科目录中可能有歧义，把「学科 / 章节 / 小节 / 知识点」完整路径与名称、描述一起索引，可以同时增强关键词与语义信号。
 
-### 4.8.2 BM25 稀疏召回
+### 4.5.2 BM25 稀疏召回
 
 BM25 基于词项匹配，特别擅长处理专有名词、缩写、型号、代码符号和准确关键词。常用形式为：
 
@@ -1409,7 +1215,7 @@ $$
 
 BM25 的弱点是无法自然识别同义改写。「显存溢出」和「GPU OOM」语义接近，但字面可能几乎不重合。
 
-### 4.8.3 Embedding 向量召回
+### 4.5.3 Embedding 向量召回
 
 向量召回将 Query 与 Chunk 编码到同一向量空间，通过 cosine similarity 或 inner product 检索语义近邻。大规模索引通常使用 HNSW、IVF 等 ANN 结构，用少量精度换取检索速度。
 
@@ -1420,7 +1226,7 @@ BM25 的弱点是无法自然识别同义改写。「显存溢出」和「GPU OO
 - 先做权限和元数据过滤，不能将无权结果召回后再交给模型判断；
 - 分数是相对相似度，不是可直接解释的正确率。
 
-### 4.8.4 混合召回与 RRF
+### 4.5.4 混合召回与 RRF
 
 稀疏召回擅长字面精确匹配，向量召回擅长语义匹配，两路结果互补。但 BM25 与 cosine similarity 的分数尺度不同，不宜直接相加。
 
@@ -1447,7 +1253,7 @@ def rrf(rank_lists, k=60):
     return sorted(scores, key=scores.get, reverse=True)
 ```
 
-### 4.8.5 Candidate Generation 与 Rerank
+### 4.5.5 Candidate Generation 与 Rerank
 
 召回阶段的目标是「尽量不漏」，通常生成几十到几百个候选；精排阶段的目标是「把最相关的放前面」。
 
@@ -1457,7 +1263,7 @@ def rrf(rank_lists, k=60):
 
 如果生产目标是输出唯一结果，召回层仍应优化 Recall@K，判别层再优化 Top-1 Accuracy。候选集里没有正确答案时，后续模型不可能挽回。
 
-### 4.8.6 Hard Negative
+### 4.5.6 Hard Negative
 
 随机负样本往往太简单，模型只需学会粗粒度主题区分。Hard Negative 应该「很像正确答案，但在关键属性上错误」，可以来自：
 
@@ -1468,7 +1274,7 @@ def rrf(rank_lists, k=60):
 
 但需要防止 false negative：标注本身不完整时，高相似候选可能实际也是正确答案。高风险 Hard Negative 应经过人工或教师模型一致性校验。
 
-### 4.8.7 评估与线上运行
+### 4.5.7 评估与线上运行
 
 | 阶段 | 关键指标 | 回答的问题 |
 |---|---|---|
@@ -1490,7 +1296,7 @@ def rrf(rank_lists, k=60):
 3. **Recall@K 很高，为什么最终结果仍然可能差？**
    Recall@K 只说明正确答案进了候选集，不保证判别模型能把它选为 Top-1，也不保证生成阶段不歪曲证据。
 
-## 4.9 Memory：全局持久化记忆层
+## 4.6 Memory：全局持久化记忆层
 
 Memory 不是 Context 的同义词，也不是脱离 Thread 的“第二个大脑”。在本文架构中：
 
@@ -1542,7 +1348,7 @@ Model → memory_search function_call JSON
 
 被动路径适合稳定偏好和明显相关的项目事实；主动路径适合模型在推理中发现“还缺少过去决策或经验”时进行定向查询。
 
-### 4.9.1 User Memory 的内部层次
+### 4.6.1 User Memory 的内部层次
 
 可以把用户级 Memory 分成四类：
 
@@ -1555,7 +1361,7 @@ Model → memory_search function_call JSON
 
 原始对话、完整 Tool Result 和临时猜测不应自动成为 Memory。它们需要经过抽取、验证和整合，才适合跨 Thread 使用。
 
-### 4.9.2 Memory Tool 的调用原型
+### 4.6.2 Memory Tool 的调用原型
 
 先看模型可见的调用形式：
 
@@ -1604,7 +1410,7 @@ def memory_write(
 
 `thread_id`、用户身份和 ACL 不应由模型作为参数传入，而应由 Harness 的 `ToolContext` 注入，防止模型越权访问其他 Thread。
 
-### 4.9.3 Memory Write Pipeline
+### 4.6.3 Memory Write Pipeline
 
 ```text
 Candidate Extraction
@@ -1630,7 +1436,7 @@ class MemoryItem:
 
 不是所有历史都应写入 Memory。临时日志、未经验证的猜测和一次性中间状态通常不值得保存。
 
-### 4.9.4 Memory Retrieval Pipeline
+### 4.6.4 Memory Retrieval Pipeline
 
 Memory 的难点不是“能存多少”，而是当前任务到来时应该召回哪些内容。
 
@@ -1688,7 +1494,7 @@ score = (
 
 召回 100 条不等于注入 100 条。最终仍要去重并服从 Token Budget。
 
-### 4.9.5 冲突、整合与遗忘
+### 4.6.5 冲突、整合与遗忘
 
 长期 Memory 必须治理：
 

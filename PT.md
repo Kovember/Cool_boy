@@ -1803,13 +1803,15 @@ while waiting or running:
 
 ##### 3.8.2 PagedAttention
 
-PagedAttention 不是一种新的 Attention 数学公式，而是 KV Cache 的分页存储与访问方法。它将每条序列的逻辑 KV Block 映射到不连续的物理 Block，Attention Kernel 通过 Block Table 找到真实地址。
+PagedAttention 解决的是 **KV Cache 如何高效放进显存**，而不是“如何判断两个请求是否拥有相同前缀”。传统做法为每条序列预留连续显存，但序列长度无法预知，容易产生预留浪费与内存碎片。PagedAttention 借鉴虚拟内存分页：把 KV Cache 切成固定大小的 Block，让逻辑上连续的 Token 映射到物理上不连续的显存块，Attention Kernel 再通过 Block Table 找到真实地址。
 
 价值主要有三点：
 
 - 不按最大序列长度连续预留，降低碎片和尾部浪费；
 - 序列边生成边按需申请 Block，结束后立即回收；
 - 通过引用计数共享 Prefix Block，支持 Prefix Cache 和分支序列。
+
+可以把它理解为 Prefix Cache 的“存储地基”：它让多个请求能够引用同一批物理 KV Block，但**前缀如何索引、何时命中、如何淘汰**仍需 APC 等上层机制完成。
 
 ##### 3.8.3 FlashAttention 与 PagedAttention 的区别
 
@@ -1822,11 +1824,32 @@ PagedAttention 不是一种新的 Attention 数学公式，而是 KV Cache 的�
 
 FlashAttention 主要优化「Attention 怎么算」，PagedAttention 主要优化「KV Cache 怎么存和怎么找」。Prefill 阶段通常更能从 FlashAttention 的 IO 优化中受益；Decode 阶段 query 通常只有一个或少量 Token，瓶颈更常是读取历史 KV 的显存带宽。
 
-##### 3.8.4 Prefix Caching
+##### 3.8.4 vLLM Automatic Prefix Caching（APC）
 
-vLLM 将已计算的完整 KV Block 按 Token 内容及相关配置建立哈希。新请求命中最长前缀后，只对未命中的后缀做 Prefill。
+APC 解决的是 **相同 Token 前缀被反复 Prefill** 的问题。vLLM 对已经计算完成的完整 KV Block 建立链式哈希：当前块的 Key 不仅包含本块 Token IDs，还包含前一块 Hash，以及 LoRA、Multi-modal Input、租户隔离 Salt 等会影响 KV 的信息。
 
-它只节省重复 Prefill，不会减少 Decode 需要读取的历史 KV。因此适合 System Prompt、Tool Schema、Few-shot Example 和公共文档前缀高度重复的场景。如果前缀中带有时间戳、随机 ID 或字段顺序不稳定，Token 序列不同就会直接 miss。
+```python
+block_hash = hash(
+    parent_block_hash,
+    block_token_ids,
+    model_and_adapter_identity,
+    multimodal_hash,
+    cache_salt,
+)
+```
+
+新请求从左向右查询连续命中的 Block，直接引用其 KV，只计算第一个 Miss 之后的 Token。只缓存完整 Block，因此即使末尾还有几个 Token 相同，也要从最后一个完整命中块之后重新计算。
+
+APC 的收益边界很明确：
+
+- **能优化**：重复 System Prompt、Tool Schema、多轮会话历史、同一长文档上的多次提问，主要降低 TTFT 和 Prefill 算力；
+- **不能优化**：完全不同的 Prompt，以及命中后的 Decode；Decode 仍要读取整段历史 KV；
+- **容易失效**：时间戳、随机 ID、工具顺序或 JSON 序列化不稳定出现在前缀前部，导致后续 Block 全部 Miss；
+- **多副本难点**：某实例有缓存不代表其他实例也有。网关需做 Cache-aware Routing，或引入跨实例 KV 传输，否则 round-robin 会稀释命中率。
+
+APC 使用 Hash Table 做 Block 级精确匹配，查找简单、容易和 PagedAttention 的 Block Pool 结合；缓存压力增大时，只能淘汰引用计数为 0 的 Block，并结合 LRU 回收。
+
+它也能缓解 Context Compression 与 Prefix Cache 的冲突。若 Context 按“稳定层 + 历史消息层 + 最近轮次层”组织，并且只低频压缩中间历史层，那么摘要变化时，APC 仍可复用前面的稳定 Block；新摘要冻结后，后续轮次又能复用“稳定层 + 摘要”形成的新前缀。它降低的是局部重算成本，并不能让变化前后的摘要共享 KV。
 
 ##### 3.8.5 Speculative Decoding
 
