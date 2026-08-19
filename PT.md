@@ -10,9 +10,9 @@
 
 #### 1.1 MLP—固定窗口的映射
 
-对于固定窗口大小为 $`T`$ 的输入序列 $`X = [x_1, x_2, ..., x_T] \in \mathbb{R}^{T \times d}`$，MLP 将每个位置独立处理：
+对于固定窗口大小为 $T$ 的输入序列 $X = [x_1, x_2, ..., x_T] \in \mathbb{R}^{T \times d}$，MLP 将每个位置独立处理：
 
-输入窗口长度固定，需展平为 $`\text{vec}(X) \in \mathbb{R}^{Td}`$：
+输入窗口长度固定，需展平为 $\text{vec}(X) \in \mathbb{R}^{Td}$：
 
 $$
 y = \sigma(W \cdot \text{vec}(X) + b)
@@ -26,7 +26,7 @@ $$
 
 #### 1.2 RNN—状态递归
 
-$`h_t`$ 表示当前时间步的隐状态，$`x_t`$ 表示当前输入：
+$h_t$ 表示当前时间步的隐状态，$x_t$ 表示当前输入：
 
 $$
 h_t = \tanh(W_h h_{t-1} + W_x x_t + b)
@@ -75,7 +75,7 @@ $$
 \text{MultiHead}(\mathbf{X}) = \text{Concat}(\text{head}_1,...,\text{head}_h)W^O,\quad \text{head}_i = \text{Attn}(\mathbf{X}W_i^Q,\ \mathbf{X}W_i^K,\ \mathbf{X}W_i^V)
 $$
 
-- **前馈层（FFN）**：$`\text{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2`$ 或写作 $`\text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2`$
+- **前馈层（FFN）**：$\text{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2$ 或写作 $\text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2$
 
 ### 2 Transformer 的架构组成
 
@@ -105,7 +105,7 @@ PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{model}}}\right)
 $$
 
 - 优点：可以外推到比训练时更长的序列；无需额外参数。
-- **Why 用 sin/cos？** 使得对于任意偏移量 $`k`$，$`PE_{pos+k}`$ 可以表示为 $`PE_{pos}`$ 的线性变换，便于模型学习相对位置。
+- **Why 用 sin/cos？** 使得对于任意偏移量 $k$，$PE_{pos+k}$ 可以表示为 $PE_{pos}$ 的线性变换，便于模型学习相对位置。
 
 2. **可学习位置编码**（BERT、GPT 等常用）
 
@@ -116,7 +116,7 @@ $$
 
 3. **RoPE（旋转位置编码）**
 
-- 不是将位置向量加到词向量上，而是通过旋转矩阵对 **Query 和 Key 向量** 施加与位置相关的变换。对于第 $`i`$ 维子空间，旋转角度为 $`\theta_i = \text{base}^{-2i/d}`$，位置 $`m`$ 的变换为：
+- 不是将位置向量加到词向量上，而是通过旋转矩阵对 **Query 和 Key 向量** 施加与位置相关的变换。对于第 $i$ 维子空间，旋转角度为 $\theta_i = \text{base}^{-2i/d}$，位置 $m$ 的变换为：
 
 $$
 f_q(q, m) = q \cdot R_{\theta_i}(m), \quad f_k(k, n) = k \cdot R_{\theta_i}(n)
@@ -153,7 +153,7 @@ def apply_rotary_emb(x, freqs_cis):
 ```
 
 - **意义**
-  - **相对位置建模**：内积结果 $`f_q(q,m) \cdot f_k(k,n)`$ 只依赖于 $`m-n`$。
+  - **相对位置建模**：内积结果 $f_q(q,m) \cdot f_k(k,n)$ 只依赖于 $m-n$。
   - **长序列外推友好**：可通过 Position Interpolation 等方法扩展上下文窗口。
   - **无额外参数**：旋转是确定的。
 
@@ -162,7 +162,7 @@ def apply_rotary_emb(x, freqs_cis):
 1. **RoPE 与绝对位置编码（如 Sinusoidal）本质区别？**
    → 绝对位置编码是在输入层加位置向量，RoPE 直接修改 Q/K，使注意力分数隐含相对位置。
 2. **如何用 RoPE 实现 4k → 32k 上下文外推？**
-   → 位置插值（PI）：将位置索引从 $`m`$ 缩小为 $`m \times (L_{\text{train}} / L_{\text{test}})`$；NTK-aware scaling：调整 base 值。
+   → 位置插值（PI）：将位置索引从 $m$ 缩小为 $m \times (L_{\text{train}} / L_{\text{test}})$；NTK-aware scaling：调整 base 值。
 3. **手写 RoPE 旋转公式（对一对维度）** → 见上方公式。
 
 
@@ -178,17 +178,17 @@ $$
 \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
 $$
 
-- **Q, K, V** 由同一个输入 $`X`$ 通过三个不同的线性变换得到。
-- **Shape**：假设输入 $`X`$ 为 `[B, S, D]`，线性变换后依然 `[B, S, D]`。
+- **Q, K, V** 由同一个输入 $X$ 通过三个不同的线性变换得到。
+- **Shape**：假设输入 $X$ 为 `[B, S, D]`，线性变换后依然 `[B, S, D]`。
   为了多头，后面会切分，但这里先看单头。
 
 **计算过程**：
 
-1. $`QK^T`$：`[B, S, D]` × `[B, D, S]` → `[B, S, S]`，表示每个位置对其他所有位置的“相似度”。
-2. 除以 $`\sqrt{d_k}`$（其中 $`d_k = D / H`$，H 为头数）。
-   - **Why？** 假设 $`q, k`$ 的每个元素均值为 0，方差为 1，那么 $`q \cdot k`$ 的方差就是 $`d_k`$。当 $`d_k`$ 较大时，点积结果会非常大，导致 softmax 进入饱和区（梯度极小）。除以 $`\sqrt{d_k}`$ 使方差回到 1，保持梯度稳定。
+1. $QK^T$：`[B, S, D]` × `[B, D, S]` → `[B, S, S]`，表示每个位置对其他所有位置的“相似度”。
+2. 除以 $\sqrt{d_k}$（其中 $d_k = D / H$，H 为头数）。
+   - **Why？** 假设 $q, k$ 的每个元素均值为 0，方差为 1，那么 $q \cdot k$ 的方差就是 $d_k$。当 $d_k$ 较大时，点积结果会非常大，导致 softmax 进入饱和区（梯度极小）。除以 $\sqrt{d_k}$ 使方差回到 1，保持梯度稳定。
 3. softmax 按行（最后一个维度）归一化，得到注意力权重。
-4. 乘以 $`V`$：`[B, S, S]` × `[B, S, D]` → `[B, S, D]`，加权聚合信息。
+4. 乘以 $V$：`[B, S, S]` × `[B, S, D]` → `[B, S, D]`，加权聚合信息。
 
 **代码（单头）**：
 
@@ -210,8 +210,8 @@ def scaled_dot_product_attention(q, k, v, mask=None):
 
 **实现步骤**：
 
-1. 线性变换得到 $`Q, K, V`$，形状 `[B, S, D]`。
-2. 将最后一维切分成 $`H`$ 个头：`[B, S, H, D_k]`（$`D = H \times D_k`$）。
+1. 线性变换得到 $Q, K, V$，形状 `[B, S, D]`。
+2. 将最后一维切分成 $H$ 个头：`[B, S, H, D_k]`（$D = H \times D_k$）。
 3. 交换维度，变成 `[B, H, S, D_k]`，方便并行计算。
 4. 对每个头独立做缩放点积注意力，得到 `[B, H, S, D_k]`。
 5. 交换回 `[B, S, H, D_k]`，合并成 `[B, S, D]`。
@@ -252,8 +252,8 @@ def multi_head_attention(x, num_heads, d_model):
 - **Padding Mask**：对输入中的填充位置（如 `[PAD]`）进行屏蔽，防止模型关注它们。
   方法：在 softmax 之前，将对应位置设为 `-inf`（或一个极小的负数），使 softmax 后的权重接近 0。
 
-- **Causal Mask（因果掩码）**：在 Decoder 中，保证位置 $`i`$ 只能看到位置 $`j \leq i`$ 的 token，防止“看到未来”。
-  方法：构造一个上三角矩阵（不含对角线），对每个 `(i, j)` 其中 $`j > i`$ 的位置设为 `-inf`。
+- **Causal Mask（因果掩码）**：在 Decoder 中，保证位置 $i$ 只能看到位置 $j \leq i$ 的 token，防止“看到未来”。
+  方法：构造一个上三角矩阵（不含对角线），对每个 `(i, j)` 其中 $j > i$ 的位置设为 `-inf`。
 
 **Shape**：通常 mask 是 `[B, 1, 1, S]` 或 `[1, 1, S, S]`，通过广播机制与 `[B, H, S, S]` 对齐。
 
@@ -267,8 +267,8 @@ $$
 \text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2
 $$
 
-- $`W_1`$ 的形状：`[d_model, d_ff]`，通常 $`d_{ff} = 4 \times d_{model}`$。
-- $`W_2`$ 的形状：`[d_ff, d_model]`。
+- $W_1$ 的形状：`[d_model, d_ff]`，通常 $d_{ff} = 4 \times d_{model}$。
+- $W_2$ 的形状：`[d_ff, d_model]`。
 - **Why 需要 FFN？**
   Attention 负责在**不同 token 之间**交换信息（线性加权），FFN 负责在**每个 token 内部**做非线性变换，提升模型表达能力。两者交替，形成了 Transformer 的“通信-计算”结构。
 
@@ -299,8 +299,8 @@ $$
   - 在 Transformer 中，LN 能使训练更稳定。
 
 - **Pre-Norm vs Post-Norm**：
-  - **Post-Norm**（原始）：$`\text{LN}(x + \text{Sublayer}(x))`$。收敛慢，需要 warmup，但理论表达能力强。
-  - **Pre-Norm**（主流）：$`x + \text{Sublayer}(\text{LN}(x))`$。梯度流更顺畅，无需 warmup，训练稳定，但可能略低于 Post-Norm 的理论上限。几乎所有大模型（GPT、LLaMA）都用 Pre-Norm。
+  - **Post-Norm**（原始）：$\text{LN}(x + \text{Sublayer}(x))$。收敛慢，需要 warmup，但理论表达能力强。
+  - **Pre-Norm**（主流）：$x + \text{Sublayer}(\text{LN}(x))$。梯度流更顺畅，无需 warmup，训练稳定，但可能略低于 Post-Norm 的理论上限。几乎所有大模型（GPT、LLaMA）都用 Pre-Norm。
 
 ##### ③ 最后的 Softmax
 
@@ -363,9 +363,6 @@ MoE 的一句话是：**总参数可以很大，但每个 Token 只激活少量 
 - **核心风险**：少数 Expert 被持续选中会形成路由坍塌与负载不均；
 - **工程代价**：需要负载均衡、容量控制和跨卡 All-to-All 通信，训练/推理并非“免费扩大参数”。
 
-<details>
-<summary>深入：Token Choice、路由策略与负载均衡推导</summary>
-
 #### 4.1 MoE 的架构细节
 
 ##### Token Choice
@@ -375,10 +372,10 @@ MoE 的一句话是：**总参数可以很大，但每个 Token 只激活少量 
 **原理**：每个 token 独立地选择最合适的 Top-K 个专家。Router 对每个 token 输出一个对所有专家的概率分布，然后每个 token 挑选概率最高的 K 个专家，将自身的表示发送给这些专家，专家的输出按路由概率加权求和。
 
 **公式**：
-对于 token $`x`$，Router 输出 logits $`h(x) = W_g x`$（$`W_g \in \mathbb{R}^{E \times d}`$），然后 softmax 得到概率 $`p = \text{softmax}(h(x))`$。选择 Top-K 索引集合 $`\mathcal{T}`$，最终输出：
+对于 token $x$，Router 输出 logits $h(x) = W_g x$（$W_g \in \mathbb{R}^{E \times d}$），再经 softmax 得到路由概率 $p$。选择 Top-K 索引集合 $\mathcal{T}$ 后，令 $g_i$ 表示第 $i$ 个 Expert，最终输出：
 
 $$
-y = \sum_{i \in \mathcal{T}} p_i \cdot \text{Expert}_i(x)
+y = \sum_{i \in \mathcal{T}} p_i g_i(x)
 $$
 
 **特点**：
@@ -394,7 +391,7 @@ $$
 **原理**：每个专家选择它要处理的 token，而不是 token 选择专家。具体来说，对所有 token 的路由分数，每个专家挑选分数最高的 Top-K 个 token（或者按容量选择）。专家输出后，再根据路由分数加权聚合回每个 token。
 
 **公式**（简化）：
-设 batch 中有 $`T`$ 个 token，每个 token 有路由分数 $`s_{t,i}`$ 表示 token $`t`$ 与专家 $`i`$ 的匹配度。专家 $`i`$ 选择分数最高的 $`C_i`$ 个 token（$`C_i`$ 可以是容量，如 $`C_i = \text{capacity\_factor} \times T/E`$）。被选中的 token 集合记为 $`\mathcal{T}_i`$，专家 $`i`$ 输出 $`y_{t,i} = \text{Expert}_i(x_t)`$。最终 token $`t`$ 的输出为：
+设 batch 中有 $T$ 个 token，每个 token 有路由分数 $s_{t,i}$ 表示 token $t$ 与专家 $i$ 的匹配度。专家 $i$ 选择分数最高的 $C_i$ 个 token，其中可取 $C_i=\gamma T/E$，$\gamma$ 为容量因子。被选中的 token 集合记为 $\mathcal{T}_i$，专家输出记为 $y_{t,i}=g_i(x_t)$。最终 token $t$ 的输出为：
 
 $$
 y_t = \sum_{i: t \in \mathcal{T}_i} \frac{s_{t,i}}{\sum_{t' \in \mathcal{T}_i} s_{t',i}} \cdot y_{t,i}
@@ -416,19 +413,19 @@ $$
 
 #### 4.2 路由选择
 
-Router的本质是一个线性层 $`W_g \in \mathbb{R}^{E \times d}`$，输入 token 的隐向量 $`x \in \mathbb{R}^d`$，输出 logits $`z = W_g x`$（维度 $`E`$，专家数量）。然后经过 softmax 得到概率分布。
+Router的本质是一个线性层 $W_g \in \mathbb{R}^{E \times d}$，输入 token 的隐向量 $x \in \mathbb{R}^d$，输出 logits $z = W_g x$（维度 $E$，专家数量）。然后经过 softmax 得到概率分布。
 
 **关点**：
 
 - **噪声注入**（训练时）：Switch Transformer 等模型在路由 logits 中添加可调节的高斯噪声，鼓励探索，防止 Router 过早收敛到次优分配。公式：
 
 $$
-z_i = \frac{x \cdot W_g^{(i)} + \epsilon \cdot \text{Softplus}(x \cdot W_{\text{noise}}^{(i)})}{\text{temperature}}
+z_i = \frac{x \cdot W_g^{(i)} + \epsilon \cdot \mathrm{softplus}(x \cdot W_n^{(i)})}{\tau}
 $$
 
-其中 $`\epsilon \sim \mathcal{N}(0,1)`$，$`W_{\text{noise}}`$ 是可学习的噪声参数。训练初期噪声大，后期逐渐降低。
+其中 $\epsilon \sim \mathcal{N}(0,1)$，$W_n$ 是可学习的噪声参数，$\tau$ 是温度。训练初期噪声大，后期逐渐降低。
 
-- **温度系数**：可以引入温度 $`T`$ 来平滑或锐化分布。$`T<1`$ 使分布更尖锐（偏向最大专家），$`T>1`$ 更平滑。通常 $`T=1`$。
+- **温度系数**：可以引入温度 $T$ 来平滑或锐化分布。$T<1$ 使分布更尖锐（偏向最大专家），$T>1$ 更平滑。通常 $T=1$。
 
 **常见问题**：
 
@@ -448,7 +445,7 @@ $$
 - **软 Top-K**：使用连续的近似，如对概率分布做 top-k 平滑（将非 Top-K 的概率置 0，再归一化），仍然可微但计算稍复杂。
 
 **容量因子（Capacity Factor）**：
-为了控制每个专家处理的 token 数量，常引入容量因子。每个专家的容量 = $`\text{capacity\_factor} \times \frac{\text{total\_tokens}}{E}`$。如果某个专家被分配的 token 超过容量，超出的 token 会被丢弃（或通过残差连接绕过专家）。容量因子通常设为 1.0~1.5，避免 token 被丢弃过多。
+为了控制每个专家处理的 token 数量，常引入容量因子。若 batch 中有 $T$ 个 token，每个专家容量可写为 $C=\gamma T/E$。如果某个专家被分配的 token 超过容量，超出的 token 会被丢弃（或通过残差连接绕过专家）。容量因子 $\gamma$ 通常设为 1.0~1.5，避免 token 被丢弃过多。
 
 **常见问题**：
 
@@ -474,29 +471,29 @@ $$
 **a) Importance-based Loss（Switch Transformer）**
 
 $$
-\mathcal{L}_{\text{aux}} = \alpha \cdot \sum_{i=1}^{E} f_i \cdot P_i
+\mathcal{L}_{aux} = \alpha \sum_{i=1}^{E} f_i P_i
 $$
 
 其中：
 
-- $`f_i = \frac{1}{T} \sum_{t=1}^{T} \mathbb{1}\{\text{token } t \text{ 选择专家 } i\}`$，即专家 $`i`$ 被选中的 token 比例。
-- $`P_i = \frac{1}{T} \sum_{t=1}^{T} p_{t,i}`$，即所有 token 对专家 $`i`$ 的平均路由概率。
-- $`\alpha`$ 是系数，通常取 0.01。
+- $f_i = \frac{1}{T} \sum_{t=1}^{T} \mathbf{1}[r(t)=i]$，其中 $r(t)$ 为 token $t$ 被路由到的专家，即专家 $i$ 被选中的 token 比例。
+- $P_i = \frac{1}{T} \sum_{t=1}^{T} p_{t,i}$，即所有 token 对专家 $i$ 的平均路由概率。
+- $\alpha$ 是系数，通常取 0.01。
 
-**解释**：当专家 $`i`$ 被选中的频率 $`f_i`$ 高，同时 Router 给它的平均概率 $`P_i`$ 也高时，损失大。这鼓励 Router 使 $`f_i`$ 和 $`P_i`$ 都接近 $`1/E`$，即均匀分布。
+**解释**：当专家 $i$ 被选中的频率 $f_i$ 高，同时 Router 给它的平均概率 $P_i$ 也高时，损失大。这鼓励 Router 使 $f_i$ 和 $P_i$ 都接近 $1/E$，即均匀分布。
 
 **b) Load-based Loss（GShard）**
-直接基于每个专家实际处理的 token 数量 $`l_i`$ 计算方差或与均值的差异：
+直接基于每个专家实际处理的 token 数量 $l_i$ 计算方差或与均值的差异：
 
 $$
-\mathcal{L}_{\text{aux}} = \alpha \cdot \sum_{i=1}^{E} \left( \frac{l_i}{T} - \frac{1}{E} \right)^2
+\mathcal{L}_{aux} = \alpha \sum_{i=1}^{E} \left( \frac{l_i}{T} - \frac{1}{E} \right)^2
 $$
 
 更直接地强制每个专家处理的 token 数量相等。
 
 **常见问题**：
 
-- 辅助损失如何与主损失（如语言建模损失）平衡？系数 $`\alpha`$ 如何选择？（通常很小，如 0.01，否则会干扰主任务）
+- 辅助损失如何与主损失（如语言建模损失）平衡？系数 $\alpha$ 如何选择？（通常很小，如 0.01，否则会干扰主任务）
 - 辅助损失是否会影响模型性能？（适当使用可提升性能，因为负载均衡本身也有利于充分利用专家容量）
 
 ##### 熵正则化（Entropy Regularization）
@@ -506,7 +503,7 @@ $$
 **公式**：
 
 $$
-\mathcal{L}_{\text{entropy}} = -\alpha \cdot \frac{1}{T} \sum_{t=1}^{T} \sum_{i=1}^{E} p_{t,i} \log p_{t,i}
+\mathcal{L}_{ent} = -\alpha \frac{1}{T} \sum_{t=1}^{T} \sum_{i=1}^{E} p_{t,i} \log p_{t,i}
 $$
 
 最大化熵（最小化负熵）使分布平坦，从而每个 token 不会过分依赖单一专家，间接促进专家利用的多样性。
@@ -520,14 +517,14 @@ $$
 **常见问题**：
 
 - 熵正则化为什么能缓解路由坍塌？（防止 Router 输出尖锐分布，迫使每个 token 考虑多个专家）
-- 熵正则化会不会导致每个 token 选择的专家过于分散，降低模型能力？（通过调节 $`\alpha`$ 可以平衡）
+- 熵正则化会不会导致每个 token 选择的专家过于分散，降低模型能力？（通过调节 $\alpha$ 可以平衡）
 
 ##### 硬约束（Hard Constraints）
 
 不通过损失惩罚，而是直接对路由施加硬性限制，确保负载均衡。
 
 **a) Expert Capacity 限制**
-每个专家设置最大 token 容量（如 $`\text{capacity} = \lceil \frac{\text{total\_tokens}}{E} \times \text{capacity\_factor} \rceil`$）。当某个专家被分配的 token 达到容量后，后续选择该专家的 token 会被强制重定向到其他专家（或直接丢弃/绕过）。
+每个专家设置最大 token 容量（如 $C=\lceil \gamma T/E \rceil$）。当某个专家被分配的 token 达到容量后，后续选择该专家的 token 会被强制重定向到其他专家（或直接丢弃/绕过）。
 
 **实现**：在训练时，记录每个专家已处理的 token 数量，当超过容量时，将该 token 的该专家分数设为 $-\infty$，使其不再被选中。
 
@@ -548,8 +545,6 @@ $$
 | **硬约束**   | 强制容量限制或随机分配 | 确保绝对均衡，直接有效     | 可能丢弃 token，实现复杂     |
 
 在实际大模型（如 Mixtral、DeepSeek-MoE）中，通常**组合使用**多种方法：主要依赖辅助损失（负载均衡损失），配合熵正则化，同时设置合理的容量因子（硬约束），以保证训练稳定性和专家利用率。
-
-</details>
 
 ### 5 多模态大模型：从图像到语言 Token
 
@@ -854,9 +849,9 @@ effective_batch_tokens
 PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到接近全量微调的效果，尤其适合 MoE 这种参数巨大的模型。
 
 **LoRA（Low-Rank Adaptation）**
-- **原理**：假设微调时的权重变化 $`\Delta W`$ 是低秩的，即 $`\Delta W = BA`$，其中 $`B \in \mathbb{R}^{d_{\text{out}} \times r}`$，$`A \in \mathbb{R}^{r \times d_{\text{in}}}`$，$`r \ll \min(d_{\text{in}}, d_{\text{out}})`$。原始前向传播变为 $`h = W_0 x + BA x`$，训练时只更新 $`B`$ 和 $`A`$，$`W_0`$ 冻结。
-- **优点**：推理时可将 $`BA`$ 合并到 $`W_0`$ 中，不增加额外延迟；参数量极少（通常 r=8~64），效果好，社区支持广泛。
-- **缺点**：需要选择合适的秩 $`r`$；如果模型本身已经过拟合，低秩假设可能限制表达能力。
+- **原理**：假设微调时的权重变化 $\Delta W$ 是低秩的，即 $\Delta W = BA$，其中 $B \in \mathbb{R}^{d_{\text{out}} \times r}$，$A \in \mathbb{R}^{r \times d_{\text{in}}}$，$r \ll \min(d_{\text{in}}, d_{\text{out}})$。原始前向传播变为 $h = W_0 x + BA x$，训练时只更新 $B$ 和 $A$，$W_0$ 冻结。
+- **优点**：推理时可将 $BA$ 合并到 $W_0$ 中，不增加额外延迟；参数量极少（通常 r=8~64），效果好，社区支持广泛。
+- **缺点**：需要选择合适的秩 $r$；如果模型本身已经过拟合，低秩假设可能限制表达能力。
 
 **Adapter**
 - **原理**：在 Transformer 的每个子层（通常 FFN 后）插入一个小型 MLP，结构为“降维 → 激活 → 升维”，例如先将 768 维降为 64 维，再升回 768 维。只训练这些 Adapter 参数。
@@ -871,7 +866,7 @@ PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到
 
 **IA³（Infused Adapter by Inhibiting and Amplifying Inner Activations）**
 - **原理**：对注意力机制的 K、V 以及 FFN 的输入分别乘以可学习的缩放向量（即对特征维度做逐元素缩放），每个向量长度等于特征维度。
-- **优点**：参数量极少（三个向量，约 $`3 \times d_{\text{model}}`$），效果在不少任务上接近 LoRA。
+- **优点**：参数量极少（三个向量，约 $3 \times d_{\text{model}}$），效果在不少任务上接近 LoRA。
 - **缺点**：实现相对小众，社区支持不如 LoRA。
 
 **常见问题**
@@ -1155,7 +1150,7 @@ RLHF 通常分三步走：**SFT**（使用监督数据微调）、**奖励模型
 #### 2.2 奖励模型训练
 
 **模型结构**
-奖励模型通常基于 SFT 模型（也可以使用更小的模型），将最后的语言建模头替换为一个 **标量输出头**（如线性层加 sigmoid），用于输出一个奖励值 $`r(x,y)`$，表示在 prompt $`x`$ 下回答 $`y`$ 的好坏。
+奖励模型通常基于 SFT 模型（也可以使用更小的模型），将最后的语言建模头替换为一个 **标量输出头**（如线性层加 sigmoid），用于输出一个奖励值 $r(x,y)$，表示在 prompt $x$ 下回答 $y$ 的好坏。
 
 **损失函数**
 使用 **pairwise ranking loss**（对比损失）：
@@ -1164,12 +1159,12 @@ $$
 \mathcal{L} = -\log \sigma\left(r_\theta(x, y_{\text{chosen}}) - r_\theta(x, y_{\text{rejected}})\right)
 $$
 
-其中 $`\sigma`$ 是 sigmoid 函数。该损失鼓励模型给 chosen 的回答打更高的分，rejected 的回答打更低的分。
+其中 $\sigma$ 是 sigmoid 函数。该损失鼓励模型给 chosen 的回答打更高的分，rejected 的回答打更低的分。
 
 **训练技巧**
 - **批处理**：由于每个 prompt 可能有多对 `(chosen, rejected)`，需要确保同一 prompt 下的所有对在同一个 batch 中，以便正负例来自相同上下文。
 - **正则化**：使用权重衰减、dropout 等防止过拟合。
-- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 $`r(x, y_{\text{chosen}}) > r(x, y_{\text{rejected}})`$ 的正确比例。此外，也可用人机对比评估。
+- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 $r(x, y_{\text{chosen}}) > r(x, y_{\text{rejected}})$ 的正确比例。此外，也可用人机对比评估。
 
 **常见问题**
 - **为什么不用均方误差（MSE）预测绝对分数？** 因为绝对分数难以标注且主观性强，pairwise 更稳定。
@@ -1179,14 +1174,34 @@ $$
 
 #### 2.3 RL 策略（PPO、DPO、GRPO）
 
+先用同一个问题建立直觉。模型回答一道数学题时，可能给出 A、B 两个解法：A 正确且清晰，B 有错误。三种方法的共同目标都是让模型以后更偏向 A；区别只在于**反馈从哪里来、是否需要模型自己探索、如何判断一次更新该走多大**。
+
+| 方法 | 模型看到的反馈 | 一句话理解 | 适合什么场景 |
+|---|---|---|---|
+| DPO | 已标好的 `chosen > rejected` | 直接让 A 的相对概率高于 B | 有高质量离线偏好数据，希望简单稳定 |
+| PPO | 模型新生成的回答 + Reward Model 打分 | 先探索，再按分数小步修正 | 有可调用的奖励模型，需要持续探索 |
+| GRPO | 同一问题采样的一组回答及其奖励 | 只比这一组里谁更好，省掉 Critic | 可验证奖励的推理任务，如数学、代码 |
+
+可以把它们看成三种反馈闭环：
+
+```text
+DPO：标注偏好对 ─────────────→ 直接提高 chosen、压低 rejected
+PPO：当前模型 → 生成回答 → Reward Model 打分 → 小步更新当前模型
+GRPO：当前模型 → 同题生成一组回答 → 组内比较奖励 → 小步更新当前模型
+```
+
 ##### PPO（Proximal Policy Optimization）
 
-PPO 是在线 RL 算法，它将奖励模型作为环境，通过交互式采样来优化策略。
+PPO 是在线 RL 算法。它不只学习旧数据中 “A 胜过 B”，而是让当前模型亲自生成新答案、交给 Reward Model 打分，再据此更新。因此它的能力上限取决于探索和奖励模型质量，但工程链路也最长。
+
+把一次 PPO 更新想成“写作—阅卷—订正”：模型写出回答，Reward Model 阅卷；高分 Token 的概率应上升、低分 Token 的概率应下降，但每次订正都不能过猛，以免把原有 SFT 能力改坏。
+
+例如模型解一道题，连续两次给出不同过程：第一次最终答案错、Reward 为 0；第二次过程严谨且答案对、Reward 为 1。PPO 不只是笼统地记住“第二篇更好”，而是把第二次生成过程中的每个 Token 都回看一遍：哪些选择更可能把答案带向高分，就提高其概率；哪些选择更可能导致低分，就降低其概率。Critic 的作用是估计“这道题平均大概能得多少分”，从而区分“真的很好”与“只是比预期稍好”。
 
 **核心流程**：
-1. **采样**：从当前策略 $`\pi_\theta`$ 中采样一批 prompt 并生成回答。
-2. **打分**：用奖励模型计算每个回答的奖励 $`r(x,y)`$。
-3. **优势估计**：使用 GAE（Generalized Advantage Estimation）计算每个 token 的优势函数 $`A_t`$，通常需要一个 critic 模型（价值网络）来估计状态价值。
+1. **采样**：从当前策略 $\pi_\theta$ 中采样一批 prompt 并生成回答。
+2. **打分**：用奖励模型计算每个回答的奖励 $r(x,y)$。
+3. **优势估计**：将奖励换成“比预期好多少”的优势 $A_t$。通常由 Critic（价值模型）估计预期分数；$A_t>0$ 表示这一步值得鼓励，$A_t<0$ 表示应收敛。
 4. **策略更新**：先计算新旧策略对同一动作的概率比：
 
 $$
@@ -1196,7 +1211,11 @@ $$
 如果优势 `A_t > 0`，说明该动作值得提高概率；如果 `A_t < 0`，则应降低概率。PPO 不允许概率比 `r_t(θ)` 在一次更新中偏离 1 太远，因此使用裁剪后的策略目标：
 
 $$
-L_{\mathrm{clip}}=\mathbb{E}_t\left[\min\left(r_tA_t,\ \mathrm{clip}(r_t,1-\epsilon,1+\epsilon)A_t\right)\right]
+c_\epsilon(r)=\min\bigl(\max(r,1-\epsilon),1+\epsilon\bigr)
+$$
+
+$$
+L_{PPO}=\mathbb{E}_t\left[\min\bigl(r_tA_t,\ c_\epsilon(r_t)A_t\bigr)\right]
 $$
 
 `clip` 将有效更新限制在旧策略附近，避免少量高优势样本让策略一步走得过远。实际训练还要同时考虑三部分：
@@ -1215,18 +1234,24 @@ $$
 **优点**：训练稳定，通过 KL 约束保留了 SFT 模型的生成能力；能充分利用奖励模型。
 **缺点**：需要同时维护四个模型（actor, critic, reference, reward），显存占用大，实现复杂。
 
+**什么时候想到 PPO？** 当“好坏”无法完全写成一份静态偏好集、但可以用 Reward Model 持续评估模型新答案时。代价是每轮都要生成、打分、计算优势并更新多套模型，因此它更像完整但昂贵的在线闭环。
+
 
 ##### DPO（Direct Preference Optimization）
 
-DPO 将 RLHF 转化为 **分类问题**，无需奖励模型和在线采样，直接使用偏好数据优化策略。
+DPO 将 RLHF 转成一个直接的偏好学习问题，不训练 Reward Model，也不要求模型在线采样。数据只需告诉它：同一问题下，回答 A 比回答 B 好。
+
+直觉上，DPO 要求模型同时满足两件事：相对参考模型，`chosen` 的概率提高，`rejected` 的概率降低；两者拉开的差距越大，损失越小。参考模型像一根安全绳，防止模型为了迎合少量偏好样本而偏离 SFT 太远。
+
+继续用 A、B 两个回答举例：训练时模型不必重新写一遍答案，也没有人在线给它打分；它只需要比较“在相同 prompt 下，我给 A 的概率是否已经比参考模型更高，同时给 B 的概率是否更低”。所以 DPO 本质上是**从已有偏好对中做一次有方向的概率对比**，不是让模型在环境中试错。
 
 **核心思想**：从偏好数据中推导出一个隐式奖励函数，并通过最大似然直接优化策略。损失函数为：
 
 $$
-\mathcal{L}_{\text{DPO}}(\pi_\theta; \pi_{\text{ref}}) = -\mathbb{E}_{(x,y_w,y_l) \sim \mathcal{D}} \left[ \log \sigma\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} \right) \right]
+\mathcal{L}_{DPO}(\pi_\theta; \pi_{ref}) = -\mathbb{E}_{(x,y_w,y_l) \sim \mathcal{D}} \left[ \log \sigma\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]
 $$
 
-其中 $`\beta`$ 是控制 KL 惩罚强度的超参数，$`\pi_{\text{ref}}`$ 是固定的参考策略（通常为 SFT 模型）。
+其中 $\beta$ 是控制 KL 惩罚强度的超参数，$\pi_{\text{ref}}$ 是固定的参考策略（通常为 SFT 模型）。
 
 **优点**：
 - 只需维护两个模型（策略和参考），无需 critic 和奖励模型，显存减半。
@@ -1237,34 +1262,47 @@ $$
 - 理论上 DPO 假设偏好数据符合 Bradley-Terry 模型，当实际偏好非此模型时可能有偏差。
 - 由于不与环境交互，无法利用奖励模型进一步探索新回答，可能局限于训练数据中的偏好分布。
 
+**什么时候想到 DPO？** 当团队已有可信的 `chosen/rejected` 数据，希望先获得稳定、低工程成本的对齐收益时。它通常是偏好优化的好起点；但如果数据没有覆盖到的问题很多，DPO 不会自己探索出那些新解法。
+
 
 ##### GRPO（Group Relative Policy Optimization）
 
-GRPO 是 DeepSeek 提出的 PPO 变体，旨在降低显存占用并简化训练流程。
+GRPO 是 PPO 的轻量变体。对同一个问题一次采样 $G$ 个回答，例如 8 个解题过程；如果其中 6 个错、2 个对，就让正确回答相对增加概率。它不问“这题理论上该得几分”，只问“这一组里谁更好”，因此可以不用 Critic。
+
+这特别适合有**可验证奖励**的任务：数学答案是否正确、代码能否通过测试、格式是否满足约束。奖励不必被标得非常精确，只要能把同一组候选大致排出高低即可。
+
+例如同一题一次生成 8 个解法，其中 2 个通过判题器、6 个失败：GRPO 把这 8 个回答当作一个“小组”。通过的回答相对组均值更好，得到正优势；失败回答相对更差，得到负优势。这样模型学的不是绝对分数“0.8 到底意味着什么”，而是“在同一次尝试的候选中，哪些推理路径更值得保留”。
 
 
-**优势计算**（无 critic，用组内均值做基线）：
+**优势计算**（无 Critic，用组内均值做基线）：
 
 $$
-A_i = \frac{r_i - \text{mean}(r_1,\dots,r_G)}{\text{std}(r_1,\dots,r_G)}
+\bar r=\frac{1}{G}\sum_{j=1}^{G}r_j,\qquad
+s_r=\sqrt{\frac{1}{G}\sum_{j=1}^{G}(r_j-\bar r)^2}
 $$
 
-其中 $`G`$ 为每组采样回答数。
+$$
+A_i=\frac{r_i-\bar r}{s_r+\delta}
+$$
+
+其中 $G$ 为每组采样回答数。
 
 **策略损失**（带 clip）：
 
 $$
-\mathcal{L}_{\text{GRPO}} = -\frac{1}{G}\sum_{i=1}^G \min\left( \frac{\pi_\theta(o_i|x)}{\pi_{\text{ref}}(o_i|x)} A_i,\ \text{clip}\left(\frac{\pi_\theta(o_i|x)}{\pi_{\text{ref}}(o_i|x)}, 1-\epsilon,1+\epsilon\right) A_i \right)
+\mathcal{L}_{GRPO} = -\frac{1}{G}\sum_{i=1}^G \min\left( \frac{\pi_\theta(o_i|x)}{\pi_{ref}(o_i|x)} A_i,\ c_\epsilon\left(\frac{\pi_\theta(o_i|x)}{\pi_{ref}(o_i|x)}\right) A_i \right)
 $$
 
 
 **核心创新**：
 - 对每个 prompt，采样一组回答（group），用组内的平均奖励作为基线（baseline），代替 critic 网络的价值估计。
-- 优势函数定义为 $`A_i = r_i - \text{mean}(r_{\text{group}})`$，其中 $`r_i`$ 是第 $`i`$ 个回答的奖励。
+- 优势函数用组均值 $\bar r$ 作基线：高于均值的回答 $A_i>0$，低于均值的回答 $A_i<0$。
 - 策略更新仍使用 PPO 的 clip 目标，但无需单独的价值网络，从而节省显存。
 
 **优点**：显存占用低于 PPO（少一个 critic 模型），且通过组内相对比较缓解了奖励尺度不一致的问题。
 **缺点**：方法较新，社区验证较少；组大小选择需权衡（过小则基线不稳定，过大则增加采样成本）。
+
+**什么时候想到 GRPO？** 当每题能低成本获得可靠的验证信号时最合适，例如单元测试、答案校验器、规则检查器。若奖励主要依赖细腻的人类主观偏好、且每题只采到极少候选，组内比较的信号会弱，此时未必比 DPO 或 PPO 更合适。
 
 **常见问题**
 - **PPO vs DPO 的核心区别**：PPO 是在线 RL，需要奖励模型和 critic，采样成本高但可探索；DPO 是离线优化，直接利用静态偏好数据，实现简单但依赖数据质量。
@@ -1336,7 +1374,7 @@ ZeRO 允许在数据并行的框架下训练比单卡显存大得多的模型，
 | 精度 | 较高 | 较低 |
 
 **损失缩放（FP16 必需）**：
-反向传播前将 loss 乘以 $`S`$（如 128），梯度更新后除以 $`S`$。
+反向传播前将 loss 乘以 $S$（如 128），梯度更新后除以 $S$。
 
 **代码（PyTorch）**：
 ```python
@@ -1426,9 +1464,11 @@ while not finished:                           # Decode：逐 Token 进行
 **内存占用**
 标准多头注意力下，整模型 KV Cache 的大小为：
 
-```math
-\text{内存} = 2 \times \text{num\_layers} \times \text{batch\_size} \times \text{num\_kv\_heads} \times \text{seq\_len} \times \text{head\_dim} \times \text{sizeof(dtype)}
-```
+$$
+M_{KV}=2LBN_{KV}SDb
+$$
+
+其中，$L$ 为层数，$B$ 为并发序列数，$N_{KV}$ 为 KV Head 数，$S$ 为序列长度，$D$ 为 Head Dim，$b$ 为每个元素的字节数。
 
 系数 2 对应 Key 和 Value。使用 GQA/MQA 时应代入 `num_kv_heads`，而不是 Query Head 数。
 
@@ -1864,6 +1904,21 @@ async def stream_with_failover(request, deadline):
 - readiness：权重是否加载、GPU 是否健康、队列/KV Cache 是否超高水位，实例能否接新流量；
 - passive health：根据真实请求的超时、502、GPU OOM 和断流率判断。
 
+健康检查不是每个请求到来时临时发起的同步 RPC，而是网关侧的**异步常驻任务**。它按固定周期探测实例、合并主动与被动信号、更新本地健康表并异步同步给其他网关；请求路由只读取这份健康快照，因此不会把探测耗时加到用户的 TTFT 上。
+
+```python
+async def health_reconciler():
+    while running:
+        for instance in registry.instances():
+            probe = await check_liveness_and_readiness(instance)
+            state = health_policy.merge(probe, passive_errors[instance])
+            health_table.update(instance, state)      # Router 读取本地快照
+            await publish_health_delta(instance, state)  # 异步传播给其他网关
+        await sleep(check_interval)
+```
+
+状态通常按 `healthy → suspect → unhealthy → half-open → healthy` 流转：连续失败才摘流，恢复后先放少量探测流量，避免短暂抖动造成频繁切换。
+
 为了避免一次网络抖动就误切流，需要连续失败阈值、滑动时间窗口、最小样本数和恢复滞回。「30 秒内切流」本质上由以下时间组成：
 
 ```text
@@ -1888,26 +1943,3 @@ circuit:{model}:{instance}
 每个网关先在本地快速判断，失败统计和 `open/half-open` 状态再同步到 Redis，避免某个网关已经熔断、其他网关仍持续把请求打向故障实例。半开阶段可用 `SET key value NX EX ...` 抢占少量探测权，防止所有网关同时探测造成流量尖峰。
 
 Redis 本身也可能故障，所以它不应成为推理链路的单点：限流可按安全策略选择短时本地保守额度或 fail-closed；熔断应继续依赖本地状态和健康检查；Prefix 元数据不可用时则退化为普通负载路由，只损失命中率，不影响请求正确性。
-
-#### 2.5 99.99% 可用性如何定义
-
-99.99% 意味着一年理论不可用时间约为 52.56 分钟。但可用性数字只有在 SLI 统计口径明确后才有意义。
-
-一个实用定义是：
-
-$$
-Availability = \frac{Valid\ Requests - Gateway\ Attributed\ Failures}{Valid\ Requests}
-$$
-
-`Gateway Attributed Failures` 可包括网关 5xx、超时、异常断流和路由失败；不应把客户端取消、非法参数和用户配额超限一律算成网关不可用。流式请求也不能在返回 HTTP 200 后就算成功，还要检查是否正常生成首 Token 并完成或有明确 finish reason。
-
-高可用的核心不是「永不失败」，而是失败能被快速发现、不被重试放大、能切到健康实例，并且整个过程可观测、可演练。
-
-**常见问题**
-
-1. **为什么不能把所有超时都重试？**
-   超时时后端可能仍在计算，盲目重试会放大 GPU 压力；流已开始时还会导致内容无法连续。
-2. **熔断和限流的区别是什么？**
-   限流是在请求进入前保护容量；熔断是在下游已经异常时停止继续尝试，防止故障扩散。
-3. **30 秒切流如何验证？**
-   主动注入进程崩溃、GPU OOM、网络不通和高延迟等故障，用 Trace 分别记录 detect、decide、propagate 和 reroute 时刻，对 P95/P99 而不只是平均值验收。
