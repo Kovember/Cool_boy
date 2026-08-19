@@ -132,8 +132,8 @@ Task Orchestration
 ```text
 Agent Harness
   ├─ Agent Runtime / ReAct Loop
-  ├─ Context、State、Memory
-  ├─ Tool Executor、Policy、Sandbox
+  ├─ Context、State、Checkpoint
+  ├─ Tool、Sandbox、RAG
   └─ Observability、Error Recovery
 
 Agent Runtime / ReAct Loop：Model Call ⇄ Tool Call / Tool Result
@@ -166,15 +166,17 @@ Thread State + User Memory + Environment
     → Context Builder → 模型输入上下文
     读取、选择、压缩并冻结
 
-OpenAI tool_calls
+Tool_calls
     → Parse → Registry Lookup → tool.execute(args, context)
     将模型意图映射为真实执行
 
-Tool Result
-    → Event Log / State Tool / User Memory Tool
-    → Thread State、外部世界或 User Memory Store
-    修改、持久化和版本化
+Tool Result / Observation
+    → Normalize → Tool Call State + Event Log + Artifact Ref
+    → 追加为 Tool Message，供下一轮 Context Builder 读取
+    记录事实、结果与外部副作用引用
 ```
+
+这里要区分**执行副作用**与**返回结果**：`tool.execute` 执行时才可能写入外部系统、Thread State 或 User Memory Store；Tool Result 本身只是这次执行的 Observation。Harness 将其规范化、持久化并回填 Context。模型若要更新 Goal / Plan 或写入长期记忆，仍需在下一轮显式调用对应的 `update_*` / `memory_write` Tool，而不是由任意 Tool Result 隐式改写状态。
 
 这就是 Harness 的核心闭环：**持久状态与外部信息被投影给模型，模型输出结构化 Tool Call，Harness 再把该调用安全地映射到真实 Tool 实现。**
 
@@ -508,123 +510,98 @@ Memory、Plan、Checkpoint 和 Subagent 都不应写成 ReAct Loop 中的特殊�
 
 **源码对照：** Pi 的 [`agent-loop.ts`](https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent-loop.ts) 和 [`packages/agent/README.md`](https://github.com/earendil-works/pi/blob/main/packages/agent/README.md)。
 
-## 2.3 Runtime State
+## 2.3 Agent Loop：如何推进、停止与恢复
 
-ReAct Loop 是执行算法，但 Runtime 还需要记录当前执行正在发生什么，例如：
+Agent Loop 不是一个持续占用线程的 `while` 循环，而是一段可被**事件推进、取消与恢复**的执行过程。模型负责决定下一步调用什么；Harness 负责保存 Thread、Tool 与 Task 的状态，并在恰当的时机调度下一次模型调用。
 
 ```text
-当前是否正在调用模型
-哪些 Tool Call 正在执行
-等待处理的控制事件
-消耗了多少 Token、时间和预算
+Context → Model → Tool Call
+                   ↓
+              异步执行 Tool
+                   ↓
+         Tool Result / 用户取消 / 故障恢复
+                   ↓
+        Harness 决定：继续下一轮、停止或恢复
 ```
 
-可以使用一个简单的瞬时状态对象：
+### 工具完成如何驱动下一轮：异步通知
+
+模型一次可以输出多个带 `tool_call_id` 的 Tool Call，但它不会观察工具执行过程。Harness 为同一轮调用创建 `step_id`，并为每个 Tool Call 持久化状态；状态表是事实来源：
+
+![Agent Harness 异步 Tool Call 通知机制](figures/agent-harness-async-tool-notification.png)
+
+```text
+tool_call_id | step_id | tool_name | status  | result / error | deadline
+call_search  | step_7  | search    | RUNNING | —              | ...
+call_read    | step_7  | read_file | SUCCEEDED | {...}        | ...
+```
+
+```text
+模型输出多个 Tool Call
+→ Harness 协程创建任务，落库：PENDING，并向 Tool Command Topic 投递 tool_call.created
+→ Harness 协程注册 step_id 的完成事件，进入 WAITING_TOOL_RESULTS 后挂起
+→ Tool Executor Consumer Group 消费命令，原子领取：PENDING → RUNNING
+→ Executor 调用真实 Tool / MCP / Subagent，写回 SUCCEEDED / FAILED / TIMEOUT + Result
+→ Executor 向 Tool Result Topic 投递 tool_call.finished（thread_id, step_id, tool_call_id）
+→ Runtime / Result Aggregator 消费完成事件，唤醒该 step 对应的 Harness 协程
+   ├─ 仍有 RUNNING：协程再次挂起
+   └─ 全部终态 / 到达总 deadline：查询状态表、按 tool_call_id 收集结果，进入下一轮 Model Call
+```
+
+```text
+Harness Thread。                  MQ                         Tool Executor
+─────────────────                 ──                         ─────────────
+创建 ToolTask + 注册等待器
+投递 Tool Command        ───→    Command Topic       ───→   消费并执行 Tool
+await step_finished()                                      →   写回状态 + Result
+                                  Result Topic        ←───   投递完成事件
+消费完成事件             ←───
+查询 step 状态
+  ├─ 未收齐：再次 await
+  └─ 已收齐：按 tool_call_id 回填结果 → Model
+```
 
 ```python
-@dataclass
-class RuntimeState:
-    phase: str = "idle"
-    active_turn_id: str | None = None
-    inflight_tool_calls: set[str] = field(default_factory=set)
-    control_queue: list[ControlEvent] = field(default_factory=list)
-    model_tokens: int = 0
+async def wait_tool_batch(thread_id, step_id):
+    subscription = mq.subscribe(
+        topic="tool_call.finished",
+        key=f"{thread_id}:{step_id}",
+        durable=True,
+    )  # 先订阅 Result Topic，再投递 Tool Command
+    while True:  # 每次循环由完成事件唤醒，不是主动轮询
+        await subscription.next()
+        calls = state_store.list_tool_calls(step_id)
+        if all(call.status in TERMINAL for call in calls):
+            return to_tool_messages(calls)  # 保留 tool_call_id
 ```
 
-这些状态属于 **Ephemeral Runtime State**，主要服务于当前进程。它不是 Agent 的长期事实来源；进程重启后，可由 Thread State、Event 与 Checkpoint 重建，而不必逐字段持久化。
+状态表记录事实，MQ  负责投递命令与完成通知；消息重复时按 `thread_id + step_id` 幂等检查即可。
+正常结果回传不轮询；仅由独立的**低频定时扫描器**兜底检查超时、过期租约或通知丢失，并将对应任务标记为 `TIMEOUT`、重试或故障接管。
 
-Agent 的自驱性来自 ReAct Loop，`Thread State` 则回答“它当前走到哪里”。Thread State 持久记录消息、Tool Call/Result、Goal、Plan、任务状态、Artifact 与外部副作用引用；每轮模型调用前，Context Builder 从其中投影出冻结的模型输入。
+### 用户打断：取消而不是等待自然结束
 
 ```text
-Thread State ──Context Builder──> Frozen Context ──> ReAct Loop
-      ^                                                     │
-      └──── Event / Tool Result / State Update ────────────┘
+User Stop → Thread: CANCELLING → 取消模型流 / Tool / Subagent
+          → 各执行单元写入 CANCELLED（已完成结果保留）
+          → 不再发起下一轮 Model Call
 ```
 
-Checkpoint 不是另一份脱离状态的对话备份，而是某个稳定边界上的 **Thread State 版本 + Event Cursor + Frozen Context Manifest（或引用）**。恢复时先加载最近 Checkpoint，再重放其后的事件；对未确认的外部写操作则用幂等键或外部资源 ID 核验，不能盲目重放。
+有副作用的 Tool 不能仅凭“已取消”就认定未执行；恢复前仍要用幂等键或外部资源 ID 核验。
 
-Runtime State 只描述当前执行快照；Pause、Abort、Steering 等不会直接修改这些字段，而是先成为控制事件，再由状态机决定何时以及如何生效。
-
----
-
-## 2.4 Agent Loop 状态机与可控性
-
-最小 ReAct Loop 只需要「调用模型—执行工具—追加结果」，但生产系统还要响应暂停、终止、转向、审批和预算限制。它们不是状态机之外的另一套机制，而是驱动同一状态机迁移的**控制事件**。
-
-数据事件推进正常 Model–Tool 链路，控制事件改变链路如何继续：
-
-| 控制事件 | 生效边界 | 状态机行为 |
-|---|---|---|
-| Abort | 立即发出取消，随后清理 | 任意活动状态 → `ABORTING` → `SETTLING` → `ABORTED` |
-| Pause | Model Call 或 Tool 原子操作后的安全点 | `PAUSING` → `PAUSED`，Resume 后回到可恢复状态 |
-| Approval | 高风险 Tool 执行前 | `WAITING_APPROVAL`，批准后重新校验并执行，拒绝则记录结果 |
-| Steering | 当前 Model Call/Tool Batch 完成后 | 进入下一次 Context Build，修改后续方向，不篡改已发出的调用 |
-| Follow-up | 当前 Run 正常收尾后 | 建立后续 Turn/Run，不插入当前原子操作 |
-| Budget Exceeded | 每次状态迁移前后 | 终止、降级或请求外部决策 |
-
-控制优先级通常为：
+### 下次如何恢复：从 Checkpoint 继续，不盲目重跑
 
 ```text
-Abort > Security Revocation > Pause > Approval > Steering > Follow-up
+Resume / 故障恢复
+→ 加载和恢复最近 Checkpoint（Thread State + Context）
+→ Context Builder 重建模型输入
+→ Agent Loop 从上次中断处继续
 ```
 
-状态集合可以实现为：
+写操作若处于未知状态，再用幂等键或外部资源 ID 做一次核验，避免重复执行即可。
 
-```text
-IDLE
-  → BUILDING_CONTEXT
-  → CALLING_MODEL
-  → PARSING_RESPONSE
-      ├─→ EMITTING_FINAL → SETTLING → IDLE
-      └─→ VALIDATING_TOOL_CALL
-              → WAITING_APPROVAL
-              → EXECUTING_TOOL
-              → RECORDING_RESULT
-              → BUILDING_CONTEXT
+Agent 的“自驱”即：**事件到达时继续，取消到达时停止，恢复请求到达时从持久状态继续。**
 
-任意活动状态
-  → PAUSING → PAUSED → RESUMING
-  → ABORTING → SETTLING → ABORTED
-  → FAILED → RETRY_WAIT → 原安全状态
-```
-
-状态转移不应由模型自由输出决定，而应由 Runtime 中的确定性 transition function 执行：
-
-```python
-def transition(state, event):
-    rule = TRANSITIONS.get((state.phase, event.type))
-    if rule is None:
-        raise InvalidTransition(state.phase, event.type)
-    next_state, effects = rule(state, event)
-    event_store.append(event)       # 先记录再执行副作用
-    state_store.save(next_state)
-    effect_queue.enqueue(effects)
-    return next_state
-```
-
-`transition` 先按优先级消费 Control Queue，再处理普通数据事件。副作用由 Effect Queue 异步执行；执行结果再以事件回到状态机，避免状态迁移函数直接调用模型、网络或工具。
-
-关键原则：
-
-- **单写者**：同一 Run 的状态只由一个执行器推进，通过 lease 或 compare-and-swap 防止双重执行；
-- **事件先行**：输入、模型响应、Tool Call、Tool Result 和控制命令都进入 append-only Event Log；
-- **稳定检查点**：在模型调用完成、工具执行前后和轮次结束处持久化 Checkpoint；
-- **恢复靠重放**：进程重启后从最后 Checkpoint 加载，重放后续事件，不持久化 socket、future 等进程内对象；
-- **副作用幂等**：为写操作生成 `idempotency_key`，记录 `started/completed/unknown` 及外部资源 ID。
-- **取消传播**：AbortSignal 必须覆盖模型流、Tool Executor、Shell 子进程、网络请求和 Subagent，随后等待资源清理；只停模型会留下后台副作用；
-- **收敛保护**：维护重复 Tool Call 指纹、连续无进展次数和剩余轮数、Token、金额、时间、工具调用与 Subagent 深度，达到阈值时停止或降级。
-
-**常见问题**
-
-1. **为什么不用一个 `while` 循环直接实现？**
-   `while` 只表达迭代，状态机才能显式约束暂停、审批、恢复和失败重试的合法边界。
-2. **Tool 已成功，但结果未落库时进程崩溃，如何恢复？**
-   依据幂等键或外部资源 ID 查询真实结果，不直接重放写操作。
-
-3. **Steering 为什么不能立即改写正在执行的 Model Call？**
-   已发出的请求拥有冻结 Context；Steering 应在安全边界进入下一轮 Context，否则运行记录不可复现，也可能与正在执行的 Tool Call 冲突。
-
-## 2.5 可观测性：Event、Trace、Metric 与 Replay
+## 2.4 可观测性：Event、Trace、Metric 与 Replay
 
 可观测性不是只记 Prompt 和 Response。建议统一关联字段：
 
@@ -1693,6 +1670,8 @@ run_tasks: queued
     ↓ TaskRunner
 Subagent A      Subagent B      Subagent C
 ```
+
+子任务和 Tool Call 使用同一套收敛思路：Lead Agent 的 Harness 协程创建 `run_tasks`（`queued → running → completed / failed / timeout`）并挂起等待；Subagent 完成后写入结果、投递 `subtask.finished` 事件，Runtime 消费事件后唤醒父任务。Lead 按 `parent_task_id` 查询本轮所有子任务；尚未结束则再次挂起，满足 `wait_all`、总 deadline 或“关键子任务完成”等 join 条件时，才将各 `task_id` 对应结果汇总进 Lead 的下一轮 Context。正常结果回传不靠 Lead 主动轮询；轮询仅用于超时、租约过期和通知丢失的故障兜底。
 
 ## 6.1 Subagent 独立执行
 
