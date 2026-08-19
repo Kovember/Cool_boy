@@ -367,6 +367,83 @@ Agent Runtime
 
 这样，Runtime 只需要处理统一的文本、Tool Call、结束状态和 Token Usage，不需要关心底层使用的是 OpenAI、Anthropic、Gemini 还是自建模型。
 
+### 流式输出：SSE 也是 Model Adapter 的适配边界
+
+模型适配不只是请求 Body 中 `messages`、`tools`、`max_tokens` 等字段的转换；流式生成时，还要统一 **SSE（Server-Sent Events）事件协议**。
+
+SSE 本质上是一条保持打开的 HTTP 响应：客户端只发起一次请求，服务端随后持续向下推送 Token 增量。典型响应头为：
+
+```http
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+```
+
+每个 SSE 事件由若干字段组成，并以空行结束：
+
+```text
+event: message.delta
+data: {"type":"text_delta","text":"你好"}
+
+```
+
+OpenAI Chat Completions 通常不显式使用 `event:` 字段，而是持续输出 `data:` 行，并以 `[DONE]` 作为结束标记：
+
+```text
+data: {"id":"chatcmpl_xxx","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"你"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_xxx","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+不同 Provider 的差异不只在字段名：
+
+| 差异 | OpenAI Chat Completions | Anthropic / Responses 等 |
+|---|---|---|
+| 事件形式 | 连续 `data:` Chunk | 常带 `event:` 类型 |
+| 文本增量 | `choices[].delta.content` | `content_block_delta`、`response.output_text.delta` 等 |
+| Tool Call | `delta.tool_calls`，参数分片到达 | `tool_use` / function-call 事件 |
+| 结束信号 | `finish_reason` + `[DONE]` | `message_stop`、`completed`、`status` 等 |
+| 用量 | 常在末尾 Chunk 返回 | 可能独立事件或仅最终响应返回 |
+
+因此，Model Adapter 应同时完成两件事：
+
+```text
+请求适配：
+统一 ModelRequest
+→ Provider HTTP Header + JSON Body
+
+响应适配：
+Provider SSE Event Stream
+→ 解析事件与增量
+→ 映射为 OpenAI-compatible SSE Chunk
+→ Agent Runtime / 上层客户端
+```
+
+对 Harness 而言，最关键的是把底层事件归一为统一语义：
+
+```text
+text_delta       文本增量
+tool_call_delta  工具名 / arguments 增量
+usage            Token 用量
+finish           stop / tool_calls / length
+error            上游异常、限流或断流
+```
+
+Tool Call 的 `arguments` 往往会被拆成多个 SSE Chunk，因此不能每收到一段就解析 JSON。Adapter 应按 `tool_call_id` 或 `index` 缓冲分片，在收到 `finish_reason = tool_calls` 后再拼接、解析并交给 Schema Validation：
+
+```python
+tool_buffers[call_id] += delta.arguments
+
+if finish_reason == "tool_calls":
+    arguments = json.loads(tool_buffers[call_id])
+    validate_tool_call(name, arguments)
+```
+
+核心结论：**HTTP JSON Body 适配解决“模型怎样被调用”，SSE 事件适配解决“生成过程怎样被持续、正确地交付”。二者共同构成生产级 Model Adapter。**
+
 ## 2.2 最小 ReAct Loop
 
 ReAct Loop 只做四件事：
