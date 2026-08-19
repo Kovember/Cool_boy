@@ -12,10 +12,10 @@
 
 对于固定窗口大小为 $T$ 的输入序列 $X = [x_1, x_2, ..., x_T] \in \mathbb{R}^{T \times d}$，MLP 将每个位置独立处理：
 
-输入窗口长度固定，需展平为 $\text{vec}(X) \in \mathbb{R}^{Td}$：
+输入窗口长度固定，需展平为 $\mathrm{vec}(X) \in \mathbb{R}^{Td}$：
 
 $$
-y = \sigma(W \cdot \text{vec}(X) + b)
+y = \sigma(W \cdot \mathrm{vec}(X) + b)
 $$
 
 **关键缺陷：**
@@ -54,28 +54,28 @@ Transformer的端到端模型：
 - **Token 嵌入**：将输入 token 映射为稠密向量
 
 $$
-\mathbf{X}_{\text{token}} = \text{Lookup}(E, \text{tokens}), \quad E \in \mathbb{R}^{V \times d_{\text{model}}}
+\mathbf{X}_{\mathrm{token}} = \mathrm{Lookup}(E, \mathrm{tokens}), \quad E \in \mathbb{R}^{V \times d_{\mathrm{model}}}
 $$
 
 - **位置编码**：注入序列顺序信息
 
 $$
-\mathbf{X} = \mathbf{X}_{\text{token}} + \mathbf{P}, \quad \mathbf{P} \in \mathbb{R}^{T \times d_{\text{model}}}
+\mathbf{X} = \mathbf{X}_{\mathrm{token}} + \mathbf{P}, \quad \mathbf{P} \in \mathbb{R}^{T \times d_{\mathrm{model}}}
 $$
 
 - **缩放点积注意力**：
 
 $$
-\text{Attn}(Q,K,V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\mathrm{Attn}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
 $$
 
 - **多头注意力**：
 
 $$
-\text{MultiHead}(\mathbf{X}) = \text{Concat}(\text{head}_1,...,\text{head}_h)W^O,\quad \text{head}_i = \text{Attn}(\mathbf{X}W_i^Q,\ \mathbf{X}W_i^K,\ \mathbf{X}W_i^V)
+\mathrm{MultiHead}(\mathbf{X}) = \mathrm{Concat}(\mathrm{head}_1,...,\mathrm{head}_h)W^O,\quad \mathrm{head}_i = \mathrm{Attn}(\mathbf{X}W_i^Q,\ \mathbf{X}W_i^K,\ \mathbf{X}W_i^V)
 $$
 
-- **前馈层（FFN）**：$\text{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2$ 或写作 $\text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2$
+- **前馈层（FFN）**：$\mathrm{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2$ 或写作 $\mathrm{FFN}(x) = \mathrm{ReLU}(xW_1 + b_1)W_2 + b_2$
 
 ### 2 Transformer 的架构组成
 
@@ -116,7 +116,7 @@ $$
 
 3. **RoPE（旋转位置编码）**
 
-- 不是将位置向量加到词向量上，而是通过旋转矩阵对 **Query 和 Key 向量** 施加与位置相关的变换。对于第 $i$ 维子空间，旋转角度为 $\theta_i = \text{base}^{-2i/d}$，位置 $m$ 的变换为：
+- 不是将位置向量加到词向量上，而是通过旋转矩阵对 **Query 和 Key 向量** 施加与位置相关的变换。对于第 $i$ 维子空间，旋转角度为 $\theta_i = \mathrm{base}^{-2i/d}$，位置 $m$ 的变换为：
 
 $$
 f_q(q, m) = q \cdot R_{\theta_i}(m), \quad f_k(k, n) = k \cdot R_{\theta_i}(n)
@@ -162,7 +162,7 @@ def apply_rotary_emb(x, freqs_cis):
 1. **RoPE 与绝对位置编码（如 Sinusoidal）本质区别？**
    → 绝对位置编码是在输入层加位置向量，RoPE 直接修改 Q/K，使注意力分数隐含相对位置。
 2. **如何用 RoPE 实现 4k → 32k 上下文外推？**
-   → 位置插值（PI）：将位置索引从 $m$ 缩小为 $m \times (L_{\text{train}} / L_{\text{test}})$；NTK-aware scaling：调整 base 值。
+   → 位置插值（PI）：将位置索引从 $m$ 缩小为 $m \times (L_{\mathrm{train}} / L_{\mathrm{test}})$；NTK-aware scaling：调整 base 值。
 3. **手写 RoPE 旋转公式（对一对维度）** → 见上方公式。
 
 
@@ -175,7 +175,7 @@ def apply_rotary_emb(x, freqs_cis):
 **公式**：
 
 $$
-\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
+\mathrm{Attention}(Q, K, V) = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
 $$
 
 - **Q, K, V** 由同一个输入 $X$ 通过三个不同的线性变换得到。
@@ -264,7 +264,7 @@ def multi_head_attention(x, num_heads, d_model):
 **公式**：
 
 $$
-\text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2
+\mathrm{FFN}(x) = \mathrm{ReLU}(xW_1 + b_1)W_2 + b_2
 $$
 
 - $W_1$ 的形状：`[d_model, d_ff]`，通常 $d_{ff} = 4 \times d_{model}$。
@@ -275,7 +275,7 @@ $$
 **现代变体**（如 LLaMA 使用 SwiGLU）：
 
 $$
-\text{SwiGLU}(x) = \text{Swish}(xW_1) \odot (xW_2)
+\mathrm{SwiGLU}(x) = \mathrm{Swish}(xW_1) \odot (xW_2)
 $$
 
 效果更好，但参数略多。
@@ -285,7 +285,7 @@ $$
 **结构**：
 
 $$
-\text{Output} = \text{LayerNorm}(x + \text{Sublayer}(x))
+\mathrm{Output} = \mathrm{LayerNorm}(x + \mathrm{Sublayer}(x))
 $$
 
 （原始 Transformer 为 Post-Norm，现代更常用 Pre-Norm）
@@ -299,8 +299,8 @@ $$
   - 在 Transformer 中，LN 能使训练更稳定。
 
 - **Pre-Norm vs Post-Norm**：
-  - **Post-Norm**（原始）：$\text{LN}(x + \text{Sublayer}(x))$。收敛慢，需要 warmup，但理论表达能力强。
-  - **Pre-Norm**（主流）：$x + \text{Sublayer}(\text{LN}(x))$。梯度流更顺畅，无需 warmup，训练稳定，但可能略低于 Post-Norm 的理论上限。几乎所有大模型（GPT、LLaMA）都用 Pre-Norm。
+  - **Post-Norm**（原始）：$\mathrm{LN}(x + \mathrm{Sublayer}(x))$。收敛慢，需要 warmup，但理论表达能力强。
+  - **Pre-Norm**（主流）：$x + \mathrm{Sublayer}(\mathrm{LN}(x))$。梯度流更顺畅，无需 warmup，训练稳定，但可能略低于 Post-Norm 的理论上限。几乎所有大模型（GPT、LLaMA）都用 Pre-Norm。
 
 ##### ③ 最后的 Softmax
 
@@ -849,7 +849,7 @@ effective_batch_tokens
 PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到接近全量微调的效果，尤其适合 MoE 这种参数巨大的模型。
 
 **LoRA（Low-Rank Adaptation）**
-- **原理**：假设微调时的权重变化 $\Delta W$ 是低秩的，即 $\Delta W = BA$，其中 $B \in \mathbb{R}^{d_{\text{out}} \times r}$，$A \in \mathbb{R}^{r \times d_{\text{in}}}$，$r \ll \min(d_{\text{in}}, d_{\text{out}})$。原始前向传播变为 $h = W_0 x + BA x$，训练时只更新 $B$ 和 $A$，$W_0$ 冻结。
+- **原理**：假设微调时的权重变化 $\Delta W$ 是低秩的，即 $\Delta W = BA$，其中 $B \in \mathbb{R}^{d_{\mathrm{out}} \times r}$，$A \in \mathbb{R}^{r \times d_{\mathrm{in}}}$，$r \ll \min(d_{\mathrm{in}}, d_{\mathrm{out}})$。原始前向传播变为 $h = W_0 x + BA x$，训练时只更新 $B$ 和 $A$，$W_0$ 冻结。
 - **优点**：推理时可将 $BA$ 合并到 $W_0$ 中，不增加额外延迟；参数量极少（通常 r=8~64），效果好，社区支持广泛。
 - **缺点**：需要选择合适的秩 $r$；如果模型本身已经过拟合，低秩假设可能限制表达能力。
 
@@ -866,7 +866,7 @@ PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到
 
 **IA³（Infused Adapter by Inhibiting and Amplifying Inner Activations）**
 - **原理**：对注意力机制的 K、V 以及 FFN 的输入分别乘以可学习的缩放向量（即对特征维度做逐元素缩放），每个向量长度等于特征维度。
-- **优点**：参数量极少（三个向量，约 $3 \times d_{\text{model}}$），效果在不少任务上接近 LoRA。
+- **优点**：参数量极少（三个向量，约 $3 \times d_{\mathrm{model}}$），效果在不少任务上接近 LoRA。
 - **缺点**：实现相对小众，社区支持不如 LoRA。
 
 **常见问题**
@@ -1156,7 +1156,7 @@ RLHF 通常分三步走：**SFT**（使用监督数据微调）、**奖励模型
 使用 **pairwise ranking loss**（对比损失）：
 
 $$
-\mathcal{L} = -\log \sigma\left(r_\theta(x, y_{\text{chosen}}) - r_\theta(x, y_{\text{rejected}})\right)
+\mathcal{L} = -\log \sigma\left(r_\theta(x, y_{\mathrm{chosen}}) - r_\theta(x, y_{\mathrm{rejected}})\right)
 $$
 
 其中 $\sigma$ 是 sigmoid 函数。该损失鼓励模型给 chosen 的回答打更高的分，rejected 的回答打更低的分。
@@ -1164,7 +1164,7 @@ $$
 **训练技巧**
 - **批处理**：由于每个 prompt 可能有多对 `(chosen, rejected)`，需要确保同一 prompt 下的所有对在同一个 batch 中，以便正负例来自相同上下文。
 - **正则化**：使用权重衰减、dropout 等防止过拟合。
-- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 $r(x, y_{\text{chosen}}) > r(x, y_{\text{rejected}})$ 的正确比例。此外，也可用人机对比评估。
+- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 $r(x, y_{\mathrm{chosen}}) > r(x, y_{\mathrm{rejected}})$ 的正确比例。此外，也可用人机对比评估。
 
 **常见问题**
 - **为什么不用均方误差（MSE）预测绝对分数？** 因为绝对分数难以标注且主观性强，pairwise 更稳定。
@@ -1205,7 +1205,7 @@ PPO 是在线 RL 算法。它不只学习旧数据中 “A 胜过 B”，而是�
 4. **策略更新**：先计算新旧策略对同一动作的概率比：
 
 $$
-r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\text{old}}(a_t|s_t)}
+r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\mathrm{old}}(a_t|s_t)}
 $$
 
 如果优势 `A_t > 0`，说明该动作值得提高概率；如果 `A_t < 0`，则应降低概率。PPO 不允许概率比 `r_t(θ)` 在一次更新中偏离 1 太远，因此使用裁剪后的策略目标：
@@ -1251,7 +1251,7 @@ $$
 \mathcal{L}_{DPO}(\pi_\theta; \pi_{ref}) = -\mathbb{E}_{(x,y_w,y_l) \sim \mathcal{D}} \left[ \log \sigma\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]
 $$
 
-其中 $\beta$ 是控制 KL 惩罚强度的超参数，$\pi_{\text{ref}}$ 是固定的参考策略（通常为 SFT 模型）。
+其中 $\beta$ 是控制 KL 惩罚强度的超参数，$\pi_{\mathrm{ref}}$ 是固定的参考策略（通常为 SFT 模型）。
 
 **优点**：
 - 只需维护两个模型（策略和参考），无需 critic 和奖励模型，显存减半。
@@ -1475,14 +1475,14 @@ $$
 例如，Llama 2 7B 有 32 层、32 个 KV Head，`head_dim=128`。使用 FP16、`batch=1`、`seq_len=4096` 时，**单层** KV Cache 为：
 
 $$
-2 \times 1 \times 32 \times 4096 \times 128 \times 2\text{ bytes}
-=64\text{ MiB}
+2 \times 1 \times 32 \times 4096 \times 128 \times 2\mathrm{ bytes}
+=64\mathrm{ MiB}
 $$
 
 乘以 32 层后，整模型约为：
 
 $$
-32\times64\text{ MiB}=2048\text{ MiB}=2\text{ GiB}
+32\times64\mathrm{ MiB}=2048\mathrm{ MiB}=2\mathrm{ GiB}
 $$
 
 当上下文从 4k 增加到 32k 时，KV Cache 线性扩大 8 倍，单请求约占 16 GiB。再叠加 Batch 和并发序列后，KV Cache 很容易超过模型权重之外的剩余显存。
