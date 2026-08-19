@@ -1,5 +1,10 @@
 # 大模型基础、后训练与推理工程
-## 一、Transformer 基础
+
+> **面试前主线：**先建立“模型如何表示与生成”→“如何用数据把模型训成可用助手”→“如何在 GPU 上高效、稳定地服务”的叙事。公式和实现用于支撑解释，而不是逐行背诵。
+
+## 一、Transformer 与多模态基础
+
+> **主线：**Transformer 用 Attention 建模 Token 间关系，Decoder-Only 用因果 Mask 按序生成；多模态模型再把图像编码为可被 LLM 消费的视觉 Token。
 
 ### 1 从 RNN 到 Transformer
 
@@ -348,7 +353,18 @@ $$
 
 **补充**：目前也有一些混合架构（如 Encoder-Decoder 的大型模型，例如 T5-11B），但主流开源模型（LLaMA, Mistral, Qwen）和闭源模型（GPT-4）都选择 Decoder-Only。
 
-### 4 MoE
+### 4 MoE：稀疏激活与路由
+
+MoE 的一句话是：**总参数可以很大，但每个 Token 只激活少量 Expert。** Router 为每个 Token 选择 Top-K 专家并加权汇总，因此用接近 Dense 模型的单 Token 计算量换取更大的参数容量。
+
+面试时优先讲清三点：
+
+- **为什么省算力**：只计算 Top-K Expert，不跑全部 Expert；
+- **核心风险**：少数 Expert 被持续选中会形成路由坍塌与负载不均；
+- **工程代价**：需要负载均衡、容量控制和跨卡 All-to-All 通信，训练/推理并非“免费扩大参数”。
+
+<details>
+<summary>深入：Token Choice、路由策略与负载均衡推导</summary>
 
 #### 4.1 MoE 的架构细节
 
@@ -533,6 +549,8 @@ $$
 
 在实际大模型（如 Mixtral、DeepSeek-MoE）中，通常**组合使用**多种方法：主要依赖辅助损失（负载均衡损失），配合熵正则化，同时设置合理的容量因子（硬约束），以保证训练稳定性和专家利用率。
 
+</details>
+
 ### 5 多模态大模型：从图像到语言 Token
 
 ![多模态大模型：图像与文本如何进入 LLM](figures/multimodal-llm-flow.png)
@@ -698,7 +716,9 @@ Tiling 的难点是局部块数量可能暴涨，而且模型必须知道每块�
 4. **视觉幻觉只是语言模型的问题吗？**
    不是。它可能来自视觉特征缺失、模态对齐不足、训练数据偏差，也可能来自解码阶段语言先验压过视觉证据。
 
-## 二、后训练、对齐与推理工程
+## 二、SFT → LoRA → 蒸馏 → 多模态 SFT
+
+> **主线：**SFT 定义目标行为，LoRA 用低成本完成领域适配，蒸馏把强模型能力迁移到更小模型，多模态 SFT 进一步学习“视觉输入—语言输出”的对齐与指令跟随。
 
 ### 1 SFT 与参数高效微调
 
@@ -1094,6 +1114,10 @@ def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
 3. **多模态 SFT 为什么要混入纯文本数据？**
    防止模型过度适应图文数据分布，导致原有语言理解、指令跟随和格式能力退化。
 
+## 三、DPO / PPO / GRPO：目标、数据与取舍
+
+> **主线：**当 SFT 只能模仿标准答案时，偏好优化进一步学习“哪个回答更好”。DPO 直接用 chosen/rejected 对优化；PPO 需要奖励模型与在线采样；GRPO 用组内相对优势降低价值模型成本。
+
 ### 2 RLHF（基于人类反馈的强化学习）
 
 #### 2.1 RLHF 数据标注格式
@@ -1338,7 +1362,9 @@ scaler.update()
    → 低精度矩阵乘法利用 Tensor Core，同时减少显存带宽占用。
 
 
-### 4 推理计算基础与在线 Serving
+## 四、KV Cache → FlashAttention → vLLM 推理引擎
+
+> **主线：**KV Cache 避免生成时反复计算历史 Token；FlashAttention 不改变 Attention 结果，而是减少中间矩阵的 HBM 搬运。两者分别优化“重复计算”和“数据搬运”。
 
 ![大模型推理链路与各类优化的作用位置](figures/llm-inference-optimization-map.png)
 
@@ -1467,103 +1493,222 @@ FlashAttention：读一个小块 → 在 SRAM 内算完 → 只写最终结果
 
 
 
-#### 4.3 INT8 量化
+### 4.3 Prefill / Decode 与性能指标
 
-量化的目标是用更少的 bit 表示权重或激活，减少模型显存、显存带宽和在硬件支持下的矩阵乘开销。INT8 的优势首先来自数据量：相比 FP16，同样数量的权重理论存储减半。
+| 指标 | 用户感受 | 主要受什么影响 |
+|---|---|---|
+| TTFT | 发出请求后，多久看到第一个字 | 排队 + Prefill + Prefix Cache |
+| TPOT | 第一个字出现后，后续生成是否流畅 | Decode batch + 显存带宽 + 跨卡通信 |
+| E2E Latency | 整个回答何时完成 | TTFT + 输出长度 × TPOT |
+| Throughput | 集群每秒完成多少请求/Token | Batch、调度、GPU 利用率 |
 
-##### 4.3.1 线性量化
+例如一个请求 TTFT 为 1 s，之后生成 200 Token，TPOT 为 30 ms，那么用户大约在 1 s 后看到首字，完整等待时间约为 $1 + 200 \times 0.03 = 7$ s。优化 TTFT 与优化 TPOT 解决的是两种不同的体感问题。
 
-对称 INT8 量化将实数 $x$ 映射到 $[-127,127]$：
+#### 4.3.1 Prefill 与 Decode
 
-$$
-s=\frac{\max |x|}{127},\qquad
-q=clip(round(x/s),-127,127),\qquad
-\hat{x}=s\cdot q
-$$
+可以把自回归生成想成「先读题，再逐字作答」：
 
-非对称量化额外使用 zero point：
+- **Prefill**：一次处理全部输入 Token，计算量大且并行度高，通常更偏计算密集；
+- **Decode**：每次生成一个新 Token，需要反复读取历史 KV Cache，通常更偏显存带宽密集。
 
-$$
-q=clip(round(x/s)+z,q_{min},q_{max}),\qquad
-\hat{x}=s(q-z)
-$$
+Prefill 像一次性读完题目：Prompt Token 可以并行计算，通常更吃算力，并决定 TTFT。Decode 像逐字作答：下一个 Token 必须等待上一个 Token，每一步还要读取历史 KV，通常更吃显存带宽，并决定 TPOT。
 
-对称量化计算更简单，常用于权重；非对称量化能更好覆盖不对称分布，但需处理 zero point。
+这里先理解两个阶段即可：KV Cache 为什么存在见 4.1，FlashAttention 如何优化 Prefill 见 4.2，vLLM 如何管理 KV、调度请求和复用公共前缀见 4.6。
 
-以权重矩阵按输出通道量化为例，每一行独立计算 scale，避免一个异常通道拉低其他通道的有效精度：
+### 4.4 vLLM 核心架构与推理机制
 
-```python
-def quantize_per_channel(weight):          # [out_features, in_features]
-    scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127
-    qweight = (weight / scale).round().clamp(-127, 127).to(torch.int8)
-    return qweight, scale
+vLLM 的核心价值是把「单个模型的前向计算」变成「多请求共享 GPU 的高吞吐推理系统」。它不只是一个 HTTP Server，而是由请求管理、调度、KV Cache 管理和 Model Executor 组成的推理引擎。沿着一次请求看，它持续重复：**入队 → 分配/复用 KV → Prefill 或 Decode → 采样 → 完成即释放资源**。
 
-def dequantize(qweight, scale):
-    return qweight.float() * scale
+```text
+API Server
+  → Input Processor / Tokenizer
+  → Engine Core
+       ├─ Scheduler
+       ├─ KV Cache Manager / Block Pool
+       └─ Model Executor
+            ├─ Attention Backend
+            ├─ Tensor/Pipeline Parallel Workers
+            └─ Sampling / Structured Output
+  → Streaming Output
 ```
 
-这段代码用于解释量化关系，不代表高性能 Kernel：真实推理需要在算子内部完成反量化或直接执行 INT8 GEMM，否则显式还原整块 FP 权重可能省显存却不省延迟。
+不同 vLLM 版本的类名与进程组织会变化，但「Scheduler 决定本轮算什么、KV Manager 决定缓存放哪里、Executor 执行模型前向」的逻辑分层不变。
 
-##### 4.3.2 Per-tensor、Per-channel 与 Per-token
+#### 4.4.1 Continuous Batching
 
-- **Per-tensor**：整个张量共享一个 scale，实现简单，但易被少数离群值拉大范围；
-- **Per-channel**：权重每个输出通道使用独立 scale，通常能明显降低权重量化误差；
-- **Per-token**：激活每个 Token 动态计算 scale，适应不同 Token 的幅值，但引入动态统计开销。
+静态 Batching 像「一车人必须一起上车、一起到终点」：只要有一条序列还没生成完，已经结束的位置也无法及时给新请求。
 
-量化粒度越细，误差通常越小，但 scale 存储、Kernel 实现和调度更复杂。
+Continuous Batching 在每个调度轮次重新组织 batch：
 
-##### 4.3.3 Weight-only 与 W8A8
+```text
+step 1: [A, B, C]
+step 2: A 结束 → [B, C, D]
+step 3: C 结束 → [B, D, E]
+```
 
-**Weight-only INT8（W8A16）**：权重以 INT8 存储，计算前或 Kernel 内反量化到 FP16/BF16，激活保持高精度。它主要降低权重显存和读取带宽，精度风险较低，但若 Kernel 只是先反量化再做 FP16 GEMM，计算加速可能有限。
+完成的序列立即离开，新请求可在下一轮加入，避免 GPU 等待最长序列。调度单位本质上是 Token 预算，Scheduler 在 Prefill 和 Decode 之间分配当轮算力。
 
-**W8A8**：权重和激活都使用 INT8，可直接利用 INT8 Tensor Core，但激活中的 outlier 会让量化更困难。因此 W8A8 的速度潜力更高，对校准数据和 Kernel 支持的要求也更高。
+它提高的是吞吐和 GPU 利用率，但 batch 过大时单请求 TPOT 与尾延迟会上升，因此仍是吞吐与延迟的取舍。
 
-##### 4.3.4 Outlier 与 SmoothQuant
+Continuous Batching 可以抽象为一个逐轮重排的调度循环：
 
-假设激活大部分位于 $[-1,1]$，却有少数值达到 50。如果整个 Tensor 用同一 scale，量化范围必须覆盖 50，$[-1,1]$ 中的大量数值就会挤在少数刻度中，丢失精度。
+```python
+while waiting or running:
+    budget = max_batched_tokens
+    batch = select_decode_requests(running, budget)   # 先保护在线 TPOT
+    budget -= token_cost(batch)
+    batch += select_prefill_chunks(waiting, budget)  # 剩余预算接纳新请求
 
-SmoothQuant 利用线性层 $Y=XW$ 的等价变换，将激活中难量化的幅值部分迁移到权重：
+    outputs = model_executor.step(batch)
+    running, finished = update_sequences(running, outputs)
+    release_blocks(finished)
+```
 
-$$
-Y=(X\,diag(s)^{-1})(diag(s)W)
-$$
+真实 vLLM 的实现远比这段伪代码复杂，但核心决策已经显现：每轮在 Decode、Prefill 和 KV Block 之间分配预算；完成序列及时退出，新请求不必等待旧 batch 全部结束。
 
-对激活做平滑后，激活更容易量化，权重通常比激活更能承受这部分尺度变化。平滑强度需在两侧误差之间取舍。
+#### 4.4.2 PagedAttention
 
-##### 4.3.5 PTQ、Calibration 与 QAT
+PagedAttention 解决的是 **很多条长度未知的 KV Cache，怎样塞进有限显存**。
 
-**PTQ** 在训练后根据权重和少量校准数据确定 scale/clipping，成本低，是部署中的常用选择。Calibration 数据不需要很大，但必须覆盖真实任务的长度、语言、模态和激活分布；只用随机短文本会导致线上 outlier 范围估计失真。
+如果按 `max_model_len` 给每个请求预留连续空间，就像客人入住时，无论住多久都先包下一整层酒店：序列提前结束会浪费，序列继续增长又难以扩展，中间还会留下无法利用的小空洞。
 
-**QAT** 在训练中插入 fake quantization，前向模拟 round/clip，反向通常使用 Straight-Through Estimator 近似梯度。它能让模型适应量化误差，但训练成本高、工程复杂。
+PagedAttention 把显存切成固定大小的“房间”。序列只维护逻辑 Block 编号，Block Table 再把它们映射到任意空闲的物理 Block：
 
-##### 4.3.6 哪些部分需要保留高精度
+```text
+序列 A 的逻辑块： [0] [1] [2]
+                     │   │   │
+Block Table：        7   1   9
+                     │   │   │
+GPU 物理块：   [1] ... [7] [8] [9]
+```
 
-不是所有算子都适合 INT8。常见做法是将 LayerNorm/RMSNorm、Softmax、采样与部分敏感层保留为 FP16/BF16，将主要 Linear/GEMM 量化。敏感层可通过逐层误差、消融实验或 Hessian/激活统计识别。
+逻辑上连续即可，物理上不必挨在一起。Attention Kernel 读取 Block Table 找到 K/V，因此数学结果不变，改变的是缓存的分配与寻址方式。
 
-KV Cache 精度与权重量化互相独立。将权重改为 INT8 不代表 KV Cache 也自动变成 INT8，因此长上下文、高并发场景仍可能被 KV Cache 显存限制。
+价值主要有三点：
 
-##### 4.3.7 量化后的端到端验证
+- 不按最大序列长度连续预留，降低碎片和尾部浪费；
+- 序列边生成边按需申请 Block，结束后立即回收；
+- 通过引用计数共享 Prefix Block，支持 Prefix Cache 和分支序列。
 
-量化效果不能只用权重文件大小衡量，应在同一硬件、并发、上下文与生成长度下比较：
+可以把它理解为 Prefix Cache 的“存储地基”：它让多个请求能够引用同一批物理 KV Block，但**前缀如何索引、何时命中、如何淘汰**仍需 APC 等上层机制完成。
 
-- 任务 Accuracy/F1、困惑度或生成质量；
-- JSON Schema/Tool Call 合法率与长序列稳定性；
-- 峰值 GPU 显存，并区分权重、KV Cache 和 Runtime Workspace；
-- TTFT、TPOT、P95/P99 与 output tokens/s；
-- 不同长度、语言、类别和多模态数据分层指标。
+Block 也不是越小越好。若每块容纳 16 Token，35 Token 需要 3 块，最后一块浪费 13 个位置；减小 Block 能减少尾部浪费，却会增加 Block Table、调度和 Kernel 寻址开销。
 
-显存减少也不必然等于延迟下降。如果硬件没有高效 INT8 Kernel，或频繁 Quantize/Dequantize，低精度可能只省显存而不加速。
+#### 4.4.3 FlashAttention 与 PagedAttention 的区别
+
+| 机制 | 一句话定位 | 主要作用阶段 |
+|---|---|---|
+| FlashAttention | 减少一次 Attention 内部的 HBM 数据搬运 | 训练与 Prefill 更明显 |
+| PagedAttention | 分页管理多条变长序列的 KV Cache | 在线推理的 KV 管理 |
+
+前者管“怎么算”，后者管“怎么存”，二者可以同时使用。FlashAttention 的计算原理见 4.2。
+
+#### 4.4.4 vLLM Automatic Prefix Caching（APC）
+
+APC 解决的是 **不同请求携带相同前缀，却每次都重新做 Prefill** 的问题。例如 100 个 Agent 请求共享同一段 8k Token 的 System Prompt 和 Tool Schema，只有用户问题不同；没有 APC，这 8k Token 会重复计算 100 次。
+
+vLLM 为已经计算完成的 KV Block 建立链式哈希。当前块的 Key 包含前一块 Hash 和本块 Token IDs，因此只有从开头连续相同的 Token 才能命中；LoRA、Multi-modal Input 和租户隔离 Salt 等影响 KV 或安全边界的信息也要进入 Hash。
+
+```python
+block_hash = hash(
+    parent_block_hash,
+    block_token_ids,
+    model_and_adapter_identity,
+    multimodal_hash,
+    cache_salt,
+)
+```
+
+新请求从左向右查询连续命中的 Block，直接引用其 KV，只计算第一个 Miss 之后的 Token。只缓存完整 Block，因此即使末尾还有几个 Token 相同，也要从最后一个完整命中块之后重新计算。
+
+```text
+已有缓存：[System 1][System 2][Tools][User A]
+新请求：  [System 1][System 2][Tools][User B]
+           └────── 直接复用 ──────┘ └─只计算这里
+```
+
+APC 的收益边界很明确：
+
+- **能优化**：重复 System Prompt、Tool Schema、多轮会话历史、同一长文档上的多次提问，主要降低 TTFT 和 Prefill 算力；
+- **不能优化**：完全不同的 Prompt，以及命中后的 Decode；Decode 仍要读取整段历史 KV；
+- **容易失效**：时间戳、随机 ID、工具顺序或 JSON 序列化不稳定出现在前缀前部，导致后续 Block 全部 Miss；
+- **多副本难点**：某实例有缓存不代表其他实例也有。网关需做 Cache-aware Routing，或引入跨实例 KV 传输，否则 round-robin 会稀释命中率。
+
+APC 使用 Hash Table 做 Block 级精确匹配，查找简单、容易和 PagedAttention 的 Block Pool 结合；缓存压力增大时，只能淘汰引用计数为 0 的 Block，并结合 LRU 回收。
+
+多副本部署时，KV Tensor 通常仍在具体 vLLM 实例的 GPU/CPU Cache 中，不应塞进 Redis。Redis 更适合记录 `prefix_hash → instance_id` 的短期亲和性元数据，帮助网关把请求送到可能命中的健康实例；最终命中仍由 vLLM 校验。实例摘流、模型重载或 Cache 淘汰后，元数据应通过 TTL 或事件及时失效。
+
+它也能缓解 Context Compression 与 Prefix Cache 的冲突。若 Context 按“稳定层 + 历史消息层 + 最近轮次层”组织，并且只低频压缩中间历史层，那么摘要变化时，APC 仍可复用前面的稳定 Block；新摘要冻结后，后续轮次又能复用“稳定层 + 摘要”形成的新前缀。它降低的是局部重算成本，并不能让变化前后的摘要共享 KV。
+
+#### 4.4.5 Speculative Decoding
+
+自回归 Decode 每次只产生一个 Token，存在强串行依赖。Speculative Decoding 用更快的 draft model 一次猜测多个 Token，target model 再一次并行验证这些候选：
+
+```text
+Draft:  猜 [t1, t2, t3, t4]
+Target: 一次前向验证
+        ├─ 接受 t1, t2, t3，t4 被拒绝
+        └─ 从拒绝位置继续生成
+```
+
+在正确的接受—拒绝算法下，最终输出分布与直接使用 target model 一致。加速来自用一次 target forward 接受多个 Token，但只在 draft 足够快且接受率较高时有利。如果 draft 猜得差，验证开销会抵消收益。
+
+决定收益的关键指标是 acceptance rate、平均每轮接受 Token 数、draft/target 速度比以及额外 KV Cache 开销。
+
+#### 4.4.6 Chunked Prefill 与 Prefill/Decode 混部
+
+一个超长 Prefill 如果在一轮中独占 GPU，正在 Decode 的用户会长时间收不到下一个 Token。Chunked Prefill 将长 Prompt 分成多个 chunk，Scheduler 可以在两个 chunk 之间插入 Decode：
+
+```text
+大 Prefill: [chunk 1] [chunk 2] [chunk 3]
+Decode:                [d]       [d]       [d]
+```
+
+这能减少长 Prompt 对 inter-token latency 的干扰，但会增加调度和中间状态管理开销。核心取舍仍然是 Prefill TTFT、Decode TPOT 与整体吞吐。
+
+#### 4.4.7 抢占、Swap 与 Recomputation
+
+当 KV Block 不足时，Scheduler 可能需要抢占低优先级或后进入的序列。被抢占序列有两种恢复方式：
+
+- **Swap**：将 KV Cache 移到 CPU，恢复时再搬回 GPU，消耗 PCIe 带宽；
+- **Recomputation**：丢弃 KV，恢复时根据已有 Token 重做 Prefill，消耗 GPU 计算。
+
+频繁 preemption 通常说明并发、最大上下文或 Token Budget 超出 KV Cache 能力。它不是免费的容量扩展，而是以延迟换取不立即 OOM。
+
+#### 4.4.8 并行推理
+
+- **Tensor Parallel**：一份模型横跨多张 GPU，同一请求由多卡共同完成；常用于模型单卡放不下，也会引入层内集合通信；
+- **Pipeline Parallel**：不同层放在不同 GPU/节点，请求的激活依次经过各 Stage；可容纳更深模型，但单请求要穿过整条流水线；
+- **Replica Serving**：每个副本持有一份完整模型，网关把不同请求分发给不同副本，以扩展集群总吞吐。它在形态上类似 Data Parallel，但推理没有梯度 AllReduce，因此更准确的说法是多副本服务。
+
+TP 并非越大越快。它减少每张卡的权重和计算，却引入每层集合通信。当模型已能放入单卡或卡间带宽不足时，增大 TP 可能反而变慢。
+
+#### 4.4.9 常见性能问题
+
+| 现象 | 首先检查 | 常见原因 |
+|---|---|---|
+| TTFT 高 | queue time、prefill time、cached tokens | 排队、长 Prompt、Prefix Miss |
+| TPOT 高 | running sequences、memory bandwidth、NCCL | Decode batch 大、显存带宽或 TP 通信 |
+| GPU 利用率低 | scheduler queue、tokenizer CPU、网关 | 请求喂不满或 CPU/网络瓶颈 |
+| preemption 多 | KV usage、running/waiting seqs | 并发与长序列挤占 KV Cache |
+| Prefix Cache 命中低 | Token 前缀、hash、副本路由 | 动态字段、Schema 顺序不稳定或路由分散 |
 
 **常见问题**
 
-1. **W8A16 和 W8A8 的核心差别？**
-   W8A16 主要压缩权重存储和带宽；W8A8 还量化激活，可使用 INT8 GEMM，但对 outlier 和校准更敏感。
-2. **为什么 INT8 显存不一定正好是 FP16 的 50%？**
-   只有被量化的权重接近减半，scale、高精度层、KV Cache、CUDA Workspace 和显存碎片都不按同一比例缩放。
-3. **为什么量化后显存降了，速度却可能没提升？**
-   运行时可能缺少原生 INT8 Kernel，或反量化、数据转换和其他非 GEMM 算子成为新瓶颈。
+1. **Continuous Batching 与普通 Dynamic Batching 有什么差别？**
+   Dynamic Batching 通常在请求开始前等待组 batch；Continuous Batching 在生成的每个调度轮次都可以移除已完成序列、加入新序列。
+2. **FlashAttention 和 PagedAttention 是否互相替代？**
+   不是。前者减少 Attention 计算的 HBM IO，后者管理变长序列的 KV Cache，两者可以同时存在。
+3. **Speculative Decoding 为什么能保持 target model 的输出分布？**
+   draft 只负责提议 Token，target 通过接受—拒绝规则校正候选；正确算法下不是直接相信 draft 输出。
+4. **为什么权重量化后仍可能 KV Cache OOM？**
+   权重和 KV Cache 是两块独立显存。量化权重释放了模型显存，但 KV 精度、并发数和序列长度不变时，KV 占用仍然会线性增长。
 
-#### 4.4 在线推理请求全链路
+## 五、LLM Serving：服务链路、网关与 Redis
+
+> **主线：**Prefill 决定首 Token 到达时间，Decode 决定后续生成速度；vLLM 在单副本内调度请求并管理 KV，Serving Gateway 在集群层面负责鉴权、路由、限流、故障切流与观测，Redis 主要承担共享限流/熔断状态与前缀亲和元数据。
+
+### 1 在线推理请求全链路
 
 先用一个请求理解整条链路。用户发送「阅读这份 20k Token 的文档并总结」，并要求流式返回：
 
@@ -1579,31 +1724,41 @@ KV Cache 精度与权重量化互相独立。将权重改为 INT8 不代表 KV C
 
 这条链路有两类调度：网关在多个推理副本之间做**粗粒度调度**，vLLM 在一个副本内对多条序列做**Token 粒度调度**。网关解决「请求送到哪里」，推理引擎解决「GPU 这一轮算哪些 Token」。
 
-##### 4.4.1 先记住四个性能指标
+#### 1.1 网关与推理引擎的协作边界
 
-| 指标 | 用户感受 | 主要受什么影响 |
-|---|---|---|
-| TTFT | 发出请求后，多久看到第一个字 | 排队 + Prefill + Prefix Cache |
-| TPOT | 第一个字出现后，后续生成是否流畅 | Decode batch + 显存带宽 + 跨卡通信 |
-| E2E Latency | 整个回答何时完成 | TTFT + 输出长度 × TPOT |
-| Throughput | 集群每秒完成多少请求/Token | Batch、调度、GPU 利用率 |
+推理服务并不是“HTTP Server 调一次 `model.generate()`”，而是两个不同尺度的运行层：
 
-例如一个请求 TTFT 为 1 s，之后生成 200 Token，TPOT 为 30 ms，那么用户大约在 1 s 后看到首字，完整等待时间约为 $1 + 200 \times 0.03 = 7$ s。优化 TTFT 与优化 TPOT 解决的是两种不同的体感问题。
+```text
+Gateway：鉴权、限流、模型池选择、副本路由、流式协议、重试与切流
+    ↓
+Inference Engine：请求队列、Prefill/Decode 调度、KV Block 分配、模型前向、采样与停止
+    ↓
+GPU / Model Executor
+```
 
-##### 4.4.2 Prefill 与 Decode
+- **推理引擎**管理单副本内的 GPU，目标是在 TTFT、TPOT 与显存水位约束下完成尽可能多的 Token；
+- **推理网关**管理集群入口，目标是让请求进入兼容、健康、容量合适的副本；
+- TensorRT / ONNX Runtime 更偏单模型图与 Kernel 执行，vLLM 更偏 LLM 的动态批处理与 KV 调度；两者处在不同层次，并不互斥。
 
-可以把自回归生成想成「先读题，再逐字作答」：
+引擎持续在每个调度 tick 推进一部分 Token：
 
-- **Prefill**：一次处理全部输入 Token，计算量大且并行度高，通常更偏计算密集；
-- **Decode**：每次生成一个新 Token，需要反复读取历史 KV Cache，通常更偏显存带宽密集。
+```python
+async def engine_step():
+    scheduled = scheduler.schedule()              # 决定本轮推进哪些 Decode / Prefill chunk
+    kv_manager.prepare(scheduled)              # 命中复用或为增长的序列分配 KV Block
+    outputs = await model_executor.forward(scheduled)
+    scheduler.update(outputs)                  # 采样、停止条件与序列状态
+    kv_manager.release_finished(scheduled)     # 仅回收已结束且引用归零的 Block
+    return stream_events(outputs)
+```
 
-Prefill 像一次性读完题目：Prompt Token 可以并行计算，通常更吃算力，并决定 TTFT。Decode 像逐字作答：下一个 Token 必须等待上一个 Token，每一步还要读取历史 KV，通常更吃显存带宽，并决定 TPOT。
+主线是：**Scheduler 决定“本轮算谁”，Executor 决定“怎么算”，KV Manager 决定“缓存如何复用、分配与回收”；网关不介入副本内每一轮 Token 调度。**
 
-这里先理解两个阶段即可：KV Cache 为什么存在见 4.1，FlashAttention 如何优化 Prefill 见 4.2，vLLM 如何管理 KV、调度请求和复用公共前缀见 4.6。
-
-#### 4.5 统一 LLM Serving 网关
+### 2 统一 LLM Serving 网关
 
 网关是所有模型服务的统一入口。它不执行模型计算，而是将「调用哪个模型、请求能否进入、送到哪个实例、失败后如何处理」变成确定性工程规则。
+
+网关的主线可以压缩为四个连续决策：**接不接（鉴权/配额）→ 调哪个模型（能力匹配）→ 送到哪台副本（负载与缓存亲和）→ 出错后怎么办（流状态决定重试或切流）**。这也是它不同于单纯反向代理或负载均衡器的原因。
 
 ![统一 LLM Serving 网关、故障切流与支撑能力](figures/llm-serving-gateway.png)
 
@@ -1617,7 +1772,7 @@ Client
   → SSE 流式返回
 ```
 
-##### 4.5.1 模型适配
+#### 2.1 模型适配
 
 对上层提供统一的 Chat/Completions/Embeddings 协议，对下层适配不同 Provider 或推理引擎。适配不只是改 URL，还包括：
 
@@ -1628,7 +1783,9 @@ Client
 
 上层只依赖网关契约，替换底层模型或 vLLM 版本时不需要修改业务代码。
 
-##### 4.5.2 鉴权、路由与限流
+这些能力不应只写在配置说明中，而应成为**版本化 Model Registry** 的一部分：`model-id → capability、上下文上限、后端、实例池、SLO、备用模型`。发布新模型时，先完成权重加载、Warmup 与 readiness 检查，再按小流量 Canary 验证 TTFT、错误率和输出契约，最后才更新默认路由；不要在承接流量的实例上直接替换权重。
+
+#### 2.2 鉴权、路由与限流
 
 **鉴权**不只校验身份，还要将身份映射到租户、允许模型、RPM/TPM 配额、最大上下文和审计策略。
 
@@ -1656,7 +1813,7 @@ active:{tenant}:{model}       当前并发数（带租约/过期时间）
 
 一次请求应同时申请 RPM、预估 TPM 和并发额度；任意一项不足就整体拒绝或回滚。仅用 `INCR` 再 `EXPIRE` 的多个命令会有并发窗口，Lua 或事务的意义是让检查与扣减成为一个原子操作。
 
-##### 4.5.3 超时、重试与幂等
+#### 2.3 超时、重试与幂等
 
 一个流式请求需要分开三种超时：
 
@@ -1688,7 +1845,7 @@ async def stream_with_failover(request, deadline):
 
 实际系统还要传递 cancellation、限制最大尝试次数并使用 request ID 做审计；核心边界始终是：一旦已向客户端输出 Token，就不能静默换实例重新生成。
 
-##### 4.5.4 熔断、降级、健康检查与异常切流
+#### 2.4 熔断、降级、健康检查与异常切流
 
 这四个机制是一条联动链路，不需要单独构造一套「高可用架构」：
 
@@ -1732,7 +1889,7 @@ circuit:{model}:{instance}
 
 Redis 本身也可能故障，所以它不应成为推理链路的单点：限流可按安全策略选择短时本地保守额度或 fail-closed；熔断应继续依赖本地状态和健康检查；Prefix 元数据不可用时则退化为普通负载路由，只损失命中率，不影响请求正确性。
 
-##### 4.5.5 99.99% 可用性如何定义
+#### 2.5 99.99% 可用性如何定义
 
 99.99% 意味着一年理论不可用时间约为 52.56 分钟。但可用性数字只有在 SLI 统计口径明确后才有意义。
 
@@ -1754,192 +1911,3 @@ $$
    限流是在请求进入前保护容量；熔断是在下游已经异常时停止继续尝试，防止故障扩散。
 3. **30 秒切流如何验证？**
    主动注入进程崩溃、GPU OOM、网络不通和高延迟等故障，用 Trace 分别记录 detect、decide、propagate 和 reroute 时刻，对 P95/P99 而不只是平均值验收。
-
-#### 4.6 vLLM 核心架构与推理机制
-
-vLLM 的核心价值是把「单个模型的前向计算」变成「多请求共享 GPU 的高吞吐推理系统」。它不只是一个 HTTP Server，而是由请求管理、调度、KV Cache 管理和 Model Executor 组成的推理引擎。
-
-```text
-API Server
-  → Input Processor / Tokenizer
-  → Engine Core
-       ├─ Scheduler
-       ├─ KV Cache Manager / Block Pool
-       └─ Model Executor
-            ├─ Attention Backend
-            ├─ Tensor/Pipeline Parallel Workers
-            └─ Sampling / Structured Output
-  → Streaming Output
-```
-
-不同 vLLM 版本的类名与进程组织会变化，但「Scheduler 决定本轮算什么、KV Manager 决定缓存放哪里、Executor 执行模型前向」的逻辑分层不变。
-
-##### 4.6.1 Continuous Batching
-
-静态 Batching 像「一车人必须一起上车、一起到终点」：只要有一条序列还没生成完，已经结束的位置也无法及时给新请求。
-
-Continuous Batching 在每个调度轮次重新组织 batch：
-
-```text
-step 1: [A, B, C]
-step 2: A 结束 → [B, C, D]
-step 3: C 结束 → [B, D, E]
-```
-
-完成的序列立即离开，新请求可在下一轮加入，避免 GPU 等待最长序列。调度单位本质上是 Token 预算，Scheduler 在 Prefill 和 Decode 之间分配当轮算力。
-
-它提高的是吞吐和 GPU 利用率，但 batch 过大时单请求 TPOT 与尾延迟会上升，因此仍是吞吐与延迟的取舍。
-
-Continuous Batching 可以抽象为一个逐轮重排的调度循环：
-
-```python
-while waiting or running:
-    budget = max_batched_tokens
-    batch = select_decode_requests(running, budget)   # 先保护在线 TPOT
-    budget -= token_cost(batch)
-    batch += select_prefill_chunks(waiting, budget)  # 剩余预算接纳新请求
-
-    outputs = model_executor.step(batch)
-    running, finished = update_sequences(running, outputs)
-    release_blocks(finished)
-```
-
-真实 vLLM 的实现远比这段伪代码复杂，但核心决策已经显现：每轮在 Decode、Prefill 和 KV Block 之间分配预算；完成序列及时退出，新请求不必等待旧 batch 全部结束。
-
-##### 4.6.2 PagedAttention
-
-PagedAttention 解决的是 **很多条长度未知的 KV Cache，怎样塞进有限显存**。
-
-如果按 `max_model_len` 给每个请求预留连续空间，就像客人入住时，无论住多久都先包下一整层酒店：序列提前结束会浪费，序列继续增长又难以扩展，中间还会留下无法利用的小空洞。
-
-PagedAttention 把显存切成固定大小的“房间”。序列只维护逻辑 Block 编号，Block Table 再把它们映射到任意空闲的物理 Block：
-
-```text
-序列 A 的逻辑块： [0] [1] [2]
-                     │   │   │
-Block Table：        7   1   9
-                     │   │   │
-GPU 物理块：   [1] ... [7] [8] [9]
-```
-
-逻辑上连续即可，物理上不必挨在一起。Attention Kernel 读取 Block Table 找到 K/V，因此数学结果不变，改变的是缓存的分配与寻址方式。
-
-价值主要有三点：
-
-- 不按最大序列长度连续预留，降低碎片和尾部浪费；
-- 序列边生成边按需申请 Block，结束后立即回收；
-- 通过引用计数共享 Prefix Block，支持 Prefix Cache 和分支序列。
-
-可以把它理解为 Prefix Cache 的“存储地基”：它让多个请求能够引用同一批物理 KV Block，但**前缀如何索引、何时命中、如何淘汰**仍需 APC 等上层机制完成。
-
-Block 也不是越小越好。若每块容纳 16 Token，35 Token 需要 3 块，最后一块浪费 13 个位置；减小 Block 能减少尾部浪费，却会增加 Block Table、调度和 Kernel 寻址开销。
-
-##### 4.6.3 FlashAttention 与 PagedAttention 的区别
-
-| 机制 | 一句话定位 | 主要作用阶段 |
-|---|---|---|
-| FlashAttention | 减少一次 Attention 内部的 HBM 数据搬运 | 训练与 Prefill 更明显 |
-| PagedAttention | 分页管理多条变长序列的 KV Cache | 在线推理的 KV 管理 |
-
-前者管“怎么算”，后者管“怎么存”，二者可以同时使用。FlashAttention 的计算原理见 4.2。
-
-##### 4.6.4 vLLM Automatic Prefix Caching（APC）
-
-APC 解决的是 **不同请求携带相同前缀，却每次都重新做 Prefill** 的问题。例如 100 个 Agent 请求共享同一段 8k Token 的 System Prompt 和 Tool Schema，只有用户问题不同；没有 APC，这 8k Token 会重复计算 100 次。
-
-vLLM 为已经计算完成的 KV Block 建立链式哈希。当前块的 Key 包含前一块 Hash 和本块 Token IDs，因此只有从开头连续相同的 Token 才能命中；LoRA、Multi-modal Input 和租户隔离 Salt 等影响 KV 或安全边界的信息也要进入 Hash。
-
-```python
-block_hash = hash(
-    parent_block_hash,
-    block_token_ids,
-    model_and_adapter_identity,
-    multimodal_hash,
-    cache_salt,
-)
-```
-
-新请求从左向右查询连续命中的 Block，直接引用其 KV，只计算第一个 Miss 之后的 Token。只缓存完整 Block，因此即使末尾还有几个 Token 相同，也要从最后一个完整命中块之后重新计算。
-
-```text
-已有缓存：[System 1][System 2][Tools][User A]
-新请求：  [System 1][System 2][Tools][User B]
-           └────── 直接复用 ──────┘ └─只计算这里
-```
-
-APC 的收益边界很明确：
-
-- **能优化**：重复 System Prompt、Tool Schema、多轮会话历史、同一长文档上的多次提问，主要降低 TTFT 和 Prefill 算力；
-- **不能优化**：完全不同的 Prompt，以及命中后的 Decode；Decode 仍要读取整段历史 KV；
-- **容易失效**：时间戳、随机 ID、工具顺序或 JSON 序列化不稳定出现在前缀前部，导致后续 Block 全部 Miss；
-- **多副本难点**：某实例有缓存不代表其他实例也有。网关需做 Cache-aware Routing，或引入跨实例 KV 传输，否则 round-robin 会稀释命中率。
-
-APC 使用 Hash Table 做 Block 级精确匹配，查找简单、容易和 PagedAttention 的 Block Pool 结合；缓存压力增大时，只能淘汰引用计数为 0 的 Block，并结合 LRU 回收。
-
-多副本部署时，KV Tensor 通常仍在具体 vLLM 实例的 GPU/CPU Cache 中，不应塞进 Redis。Redis 更适合记录 `prefix_hash → instance_id` 的短期亲和性元数据，帮助网关把请求送到可能命中的健康实例；最终命中仍由 vLLM 校验。实例摘流、模型重载或 Cache 淘汰后，元数据应通过 TTL 或事件及时失效。
-
-它也能缓解 Context Compression 与 Prefix Cache 的冲突。若 Context 按“稳定层 + 历史消息层 + 最近轮次层”组织，并且只低频压缩中间历史层，那么摘要变化时，APC 仍可复用前面的稳定 Block；新摘要冻结后，后续轮次又能复用“稳定层 + 摘要”形成的新前缀。它降低的是局部重算成本，并不能让变化前后的摘要共享 KV。
-
-##### 4.6.5 Speculative Decoding
-
-自回归 Decode 每次只产生一个 Token，存在强串行依赖。Speculative Decoding 用更快的 draft model 一次猜测多个 Token，target model 再一次并行验证这些候选：
-
-```text
-Draft:  猜 [t1, t2, t3, t4]
-Target: 一次前向验证
-        ├─ 接受 t1, t2, t3，t4 被拒绝
-        └─ 从拒绝位置继续生成
-```
-
-在正确的接受—拒绝算法下，最终输出分布与直接使用 target model 一致。加速来自用一次 target forward 接受多个 Token，但只在 draft 足够快且接受率较高时有利。如果 draft 猜得差，验证开销会抵消收益。
-
-决定收益的关键指标是 acceptance rate、平均每轮接受 Token 数、draft/target 速度比以及额外 KV Cache 开销。
-
-##### 4.6.6 Chunked Prefill 与 Prefill/Decode 混部
-
-一个超长 Prefill 如果在一轮中独占 GPU，正在 Decode 的用户会长时间收不到下一个 Token。Chunked Prefill 将长 Prompt 分成多个 chunk，Scheduler 可以在两个 chunk 之间插入 Decode：
-
-```text
-大 Prefill: [chunk 1] [chunk 2] [chunk 3]
-Decode:                [d]       [d]       [d]
-```
-
-这能减少长 Prompt 对 inter-token latency 的干扰，但会增加调度和中间状态管理开销。核心取舍仍然是 Prefill TTFT、Decode TPOT 与整体吞吐。
-
-##### 4.6.7 抢占、Swap 与 Recomputation
-
-当 KV Block 不足时，Scheduler 可能需要抢占低优先级或后进入的序列。被抢占序列有两种恢复方式：
-
-- **Swap**：将 KV Cache 移到 CPU，恢复时再搬回 GPU，消耗 PCIe 带宽；
-- **Recomputation**：丢弃 KV，恢复时根据已有 Token 重做 Prefill，消耗 GPU 计算。
-
-频繁 preemption 通常说明并发、最大上下文或 Token Budget 超出 KV Cache 能力。它不是免费的容量扩展，而是以延迟换取不立即 OOM。
-
-##### 4.6.8 并行推理
-
-- **Tensor Parallel**：一份模型横跨多张 GPU，同一请求由多卡共同完成；常用于模型单卡放不下，也会引入层内集合通信；
-- **Pipeline Parallel**：不同层放在不同 GPU/节点，请求的激活依次经过各 Stage；可容纳更深模型，但单请求要穿过整条流水线；
-- **Replica Serving**：每个副本持有一份完整模型，网关把不同请求分发给不同副本，以扩展集群总吞吐。它在形态上类似 Data Parallel，但推理没有梯度 AllReduce，因此更准确的说法是多副本服务。
-
-TP 并非越大越快。它减少每张卡的权重和计算，却引入每层集合通信。当模型已能放入单卡或卡间带宽不足时，增大 TP 可能反而变慢。
-
-##### 4.6.9 常见性能问题
-
-| 现象 | 首先检查 | 常见原因 |
-|---|---|---|
-| TTFT 高 | queue time、prefill time、cached tokens | 排队、长 Prompt、Prefix Miss |
-| TPOT 高 | running sequences、memory bandwidth、NCCL | Decode batch 大、显存带宽或 TP 通信 |
-| GPU 利用率低 | scheduler queue、tokenizer CPU、网关 | 请求喂不满或 CPU/网络瓶颈 |
-| preemption 多 | KV usage、running/waiting seqs | 并发与长序列挤占 KV Cache |
-| Prefix Cache 命中低 | Token 前缀、hash、副本路由 | 动态字段、Schema 顺序不稳定或路由分散 |
-
-**常见问题**
-
-1. **Continuous Batching 与普通 Dynamic Batching 有什么差别？**
-   Dynamic Batching 通常在请求开始前等待组 batch；Continuous Batching 在生成的每个调度轮次都可以移除已完成序列、加入新序列。
-2. **FlashAttention 和 PagedAttention 是否互相替代？**
-   不是。前者减少 Attention 计算的 HBM IO，后者管理变长序列的 KV Cache，两者可以同时存在。
-3. **Speculative Decoding 为什么能保持 target model 的输出分布？**
-   draft 只负责提议 Token，target 通过接受—拒绝规则校正候选；正确算法下不是直接相信 draft 输出。
-4. **为什么权重量化后仍可能 KV Cache OOM？**
-   权重和 KV Cache 是两块独立显存。量化权重释放了模型显存，但 KV 精度、并发数和序列长度不变时，KV 占用仍然会线性增长。

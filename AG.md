@@ -13,7 +13,7 @@ lang: zh-CN
 
 | 容易混淆的概念 | 更准确的边界 |
 |---|---|
-| ReAct Loop 与 Agent Runtime | Loop 是无状态执行算法；Runtime 是围绕 Loop 的有状态执行器 |
+| ReAct Loop、Thread State 与 Agent Runtime | ReAct Loop 驱动 Agent 自主循环；Thread State 记录可恢复事实；Runtime 管当前进程的执行状态 |
 | Runtime 与 Harness | Runtime 管当前怎么运行；Harness 管上下文、持久化、安全与治理 |
 | Context 与 Thread State | Context 是本轮模型输入快照；Thread State 是持久化的状态数据 |
 | Function Calling 与 MCP | Function Calling 是 Model↔Harness 动作协议；MCP 是 Harness↔Tool Server 协议 |
@@ -166,7 +166,7 @@ Thread State + User Memory + Environment
     → Context Builder → 模型输入上下文
     读取、选择、压缩并冻结
 
-Model function_call JSON
+OpenAI tool_calls
     → Parse → Registry Lookup → tool.execute(args, context)
     将模型意图映射为真实执行
 
@@ -378,20 +378,25 @@ ReAct Loop 只做四件事：
 把 Tool Result 返回模型
 ```
 
-模型返回的 Tool Call 是一段结构化数据：
+全文以 OpenAI Chat Completions 的 Tool Calling 结构为准。模型返回的是 Assistant Message 中的 `tool_calls`：
 
 ```json
 {
-  "type": "function_call",
-  "call_id": "call_test_1",
-  "name": "run_tests",
-  "arguments": {
-    "target": "tests/test_parser.py"
-  }
+  "role": "assistant",
+  "tool_calls": [
+    {
+      "id": "call_test_1",
+      "type": "function",
+      "function": {
+        "name": "run_tests",
+        "arguments": "{\"target\":\"tests/test_parser.py\"}"
+      }
+    }
+  ]
 }
 ```
 
-Harness 执行工具后，将 Tool Result 与相同的 `call_id` 关联，再发送给模型。模型可能继续调用 `read_file`、`apply_patch` 和 `run_tests`，直到不再产生 Tool Call。
+Harness 执行工具后，以相同的 `tool_call_id` 追加 `role: "tool"` 消息，再发送给模型。模型可能继续调用 `read_file`、`apply_patch` 和 `run_tests`，直到不再产生 Tool Call。
 
 最小循环非常简单：
 
@@ -449,7 +454,17 @@ class RuntimeState:
     model_tokens: int = 0
 ```
 
-这些状态属于 **Ephemeral Runtime State**，主要服务于当前进程。进程重启后，可以根据 Thread、Event 和 Checkpoint 重新构建，而不必逐字段持久化。
+这些状态属于 **Ephemeral Runtime State**，主要服务于当前进程。它不是 Agent 的长期事实来源；进程重启后，可由 Thread State、Event 与 Checkpoint 重建，而不必逐字段持久化。
+
+Agent 的自驱性来自 ReAct Loop，`Thread State` 则回答“它当前走到哪里”。Thread State 持久记录消息、Tool Call/Result、Goal、Plan、任务状态、Artifact 与外部副作用引用；每轮模型调用前，Context Builder 从其中投影出冻结的模型输入。
+
+```text
+Thread State ──Context Builder──> Frozen Context ──> ReAct Loop
+      ^                                                     │
+      └──── Event / Tool Result / State Update ────────────┘
+```
+
+Checkpoint 不是另一份脱离状态的对话备份，而是某个稳定边界上的 **Thread State 版本 + Event Cursor + Frozen Context Manifest（或引用）**。恢复时先加载最近 Checkpoint，再重放其后的事件；对未确认的外部写操作则用幂等键或外部资源 ID 核验，不能盲目重放。
 
 Runtime State 只描述当前执行快照；Pause、Abort、Steering 等不会直接修改这些字段，而是先成为控制事件，再由状态机决定何时以及如何生效。
 
@@ -575,21 +590,26 @@ Tool-call 是模型作用于外部世界的统一通道。无论底层是 Python
 
 ### 第一层：Tool 注册信息进入模型请求
 
-Harness 从 Tool Registry 读取名称、描述和 JSON Schema，并将它们随模型请求发送：
+Harness 从 Tool Registry 读取名称、描述和 JSON Schema，并按 OpenAI `tools` 字段格式随模型请求发送：
 
 ```json
 {
-  "name": "web_search",
-  "description": "Search the public web for current information.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "limit": {"type": "integer", "minimum": 1, "maximum": 10},
-      "query": {"type": "string"},
-      "includeContent": {"type": "boolean"}
-    },
-    "required": ["query"]
-  }
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "web_search",
+      "description": "Search the public web for current information.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+          "query": {"type": "string"},
+          "includeContent": {"type": "boolean"}
+        },
+        "required": ["query"]
+      }
+    }
+  }]
 }
 ```
 
@@ -597,47 +617,38 @@ Harness 从 Tool Registry 读取名称、描述和 JSON Schema，并将它们随
 
 ### 第二层：模型返回 function_call JSON
 
-模型根据 Tool description 和 Schema 生成结构化调用：
+模型根据 Tool description 和 Schema，在 Assistant Message 的 `tool_calls` 中生成调用：
 
 ```json
 {
-  "type": "function_call",
-  "call_id": "call_123",
-  "name": "web_search",
-  "arguments": {
-    "limit": 5,
-    "query": "2026年7月27日 今日 要闻 路透社",
-    "includeContent": false
-  }
+  "role": "assistant",
+  "tool_calls": [{
+    "id": "call_123",
+    "type": "function",
+    "function": {
+      "name": "web_search",
+      "arguments": "{\"limit\":5,\"query\":\"2026年7月27日 今日 要闻 路透社\",\"includeContent\":false}"
+    }
+  }]
 }
 ```
 
-有些 Provider 会把 `arguments` 在线协议中序列化为 JSON 字符串；Model Adapter 应把它统一解析为字典。
+OpenAI 在线协议将 `function.arguments` 序列化为 JSON 字符串；Harness 解析后再做 Schema 和业务校验。其他 Provider 由 Model Adapter 映射为同一套 OpenAI 语义，不在正文另设调用格式。
 
 ### 第三层：Harness 映射到 Tool 实例并执行
 
-Model Adapter 将 Provider 输出归一化为内部对象：
+Harness 从 OpenAI `tool_calls[].function` 读取名称和参数，随后执行：
 
 ```python
-@dataclass
-class ToolCall:
-    id: str
-    name: str
-    arguments: dict
-```
-
-随后 Harness 执行：
-
-```python
-call = model_adapter.parse_tool_call(raw_json)
-tool = registry.get(call.name)
-args = validate(tool.input_schema, call.arguments)
+call = response.message.tool_calls[0]
+tool = registry.get(call.function.name)
+args = validate(tool.input_schema, json.loads(call.function.arguments))
 result = await tool.execute(args, tool_context)
 ```
 
 因此最准确的表述是：
 
-> **模型只生成 Tool Call JSON；Harness 解析 `name` 和 `arguments`，通过 Registry 找到 Tool 对象，最终由 Harness 调用 `tool.execute(args, context)`。模型从未直接调用函数。**
+> **模型只生成 OpenAI `tool_calls`；Harness 解析 `function.name` 与 `function.arguments`，通过 Registry 找到 Tool 对象，最终调用 `tool.execute(args, context)`。模型从未直接调用函数。**
 
 ## 3.2 Unified Tool Protocol
 
@@ -800,12 +811,15 @@ github.search_issues
 
 ```json
 {
-  "type": "function_call",
-  "call_id": "call_123",
-  "name": "github.search_issues",
-  "arguments": {
-    "query": "sandbox bug"
-  }
+  "role": "assistant",
+  "tool_calls": [{
+    "id": "call_123",
+    "type": "function",
+    "function": {
+      "name": "github.search_issues",
+      "arguments": "{\"query\":\"sandbox bug\"}"
+    }
+  }]
 }
 ```
 
@@ -890,12 +904,15 @@ Skill 是针对某类任务准备的程序性知识，例如代码审查、测�
 
 ```json
 {
-  "type": "function_call",
-  "call_id": "call_skill_1",
-  "name": "load_skill",
-  "arguments": {
-    "skill_name": "python-test-debugging"
-  }
+  "role": "assistant",
+  "tool_calls": [{
+    "id": "call_skill_1",
+    "type": "function",
+    "function": {
+      "name": "load_skill",
+      "arguments": "{\"skill_name\":\"python-test-debugging\"}"
+    }
+  }]
 }
 ```
 
@@ -1040,21 +1057,23 @@ Thread State + User Memory + Environment / Retrieval
 
 ## 4.2 上下文三层结构
 
-来源经过 Context Builder 选择后，最终模型输入更适合按**变化频率**分成三层：
+来源经过 Context Builder 选择后，最终模型输入应按**物理 Token 布局与变化方式**分成三段：
 
 | 层次 | 典型内容 | 变化方式 | 处理策略 |
 |---|---|---|---|
-| 稳定层 | System/Developer 指令、固定 Tool Schema、Skill Metadata、长期有效约束 | 跨轮基本不变 | 原文保留、确定性序列化，形成可复用 Prefix |
-| 历史消息层 | 已封闭的旧对话、Tool Call/Result、阶段决策、旧检索证据 | 低频重写 | 主要压缩对象；分段摘要、Artifact 化，并冻结压缩版本 |
-| 最近轮次层 | 最近几轮对话、当前 Tool Result、最新用户输入和当轮检索 | 每轮追加或替换 | 尽量保留原文，保证局部推理、指代和纠错信息完整 |
+| 固定前缀 | System/Developer 指令、稳定的 OpenAI Tool JSON、Skill Catalog、长期有效约束 | 全程不变 | 字节、排序和序列化均固定，形成可复用 Prefix |
+| 中间历史 | Conversation History、已完成 Tool Call/Result、阶段决策与旧证据 | 正常只在尾部 append；超窗时低频压缩封闭片段 | 主要压缩对象；分段摘要、Artifact 化，并冻结压缩版本 |
+| 动态末尾 | 本轮 User Query、本轮 Tool Result、当轮检索内容 | 每轮追加 | 保留原文，保证局部推理、指代和纠错信息完整 |
 
 ```text
-┌──────────────── 稳定层：长期不变，可持续命中 Prefix Cache
-├──────────────── 历史消息层：封闭后低频分段压缩
-└──────────────── 最近轮次层：保留原文，持续追加
+┌──────────────── 固定前缀：System + Tool JSON + Skill Catalog，始终不变
+├──────────────── 中间历史：Message 列表顺序追加，封闭后才低频压缩
+└──────────────── 动态末尾：本轮 Query / Tool Result / Retrieval，每轮新增
 ```
 
-三层是模型输入的**物理布局**，前面的四类是信息的**逻辑来源**。例如 RAG 结果首次出现时属于最近轮次层；任务继续推进后，有价值的结论进入历史消息层，原文则转存 Artifact；真正长期稳定的用户事实也可以沉淀到 Memory，但不会因此自动塞进稳定前缀。
+这三段是模型输入的**物理布局**，前面的 Thread、Memory、Workspace、Retrieval 是信息的**逻辑来源**。例如 RAG 结果首次出现时位于动态末尾；任务推进后，有价值的结论进入中间历史，原文则转存 Artifact；真正长期稳定的用户事实也可以沉淀到 Memory，但不会因此自动塞进固定前缀。Skill Catalog 是固定前缀的一部分，按需 `load_skill` 后的完整 Skill 内容则作为后续 Tool Result 进入消息历史。
+
+这种布局同时服务两件事：长上下文中常见的“首尾更容易被模型利用”现象，以及 Prefix Cache 复用。前者不能简单归因于因果注意力：因果注意力只规定 token 只能访问左侧；位置偏置、训练数据分布、近期信息与长上下文退化共同造成了类似 U 型的利用率。后者要求从开头到变化点之前的 Token 连续一致，因此固定前缀必须稳定，消息历史也应以 append 为主。
 
 窗口预算不能用字符数估算，必须使用目标模型 Tokenizer，并预留输出、Tool Schema 变化和 safety margin：
 
@@ -1071,9 +1090,9 @@ input_budget = context_window
 
 长任务不能无限追加全部历史。压缩的主要目标是三层中的**历史消息层**，不是平均裁剪整个 Context：
 
-- 稳定层保持字节与顺序不变，避免破坏长期约束和 Prefix Cache；
-- 最近轮次层保留原文，避免丢失指代关系、最新反馈和工具交互细节；
-- 已封闭的历史消息分段压缩为 Summary；
+- 固定前缀保持字节与顺序不变，避免破坏长期约束和 Prefix Cache；
+- 动态末尾保留原文，避免丢失指代关系、最新反馈和工具交互细节；
+- 已封闭的中间历史分段压缩为 Summary；
 - 超长 Tool Result 只保留摘要和 Artifact 引用；
 - 去除重复日志、过期 Plan 和重复文件片段；
 - Subagent 只返回结论、Evidence 和未解决问题；
@@ -1109,12 +1128,12 @@ artifacts: 可再读取的外部内容引用
 
 冲突的根源是：历史压缩会改写 Token，而 Prefix Cache 只能复用从开头连续一致的 Token。若每轮都重新总结整段会话，摘要后面的 Token 即使没有变化，也会因前缀断裂而全部失去命中。
 
-解法不是放弃压缩，而是让三层承担不同职责：稳定层永不因历史压缩而变化；历史消息层只在越过水位后低频生成新版本；最近轮次层保持原文并持续追加。
+解法不是放弃压缩，而是让三段承担不同职责：固定前缀永不因历史压缩而变化；中间历史只在越过水位后低频生成新版本；动态末尾保持原文并持续追加。
 
 ```text
-[稳定层：System + Tool/Skill Metadata]       ← 长期命中
-[历史层：summary_vN + 未压缩的封闭片段]      ← 低频变化
-[最近层：最近几轮 + 当前 Tool/RAG + 新输入]  ← 高频追加
+[固定前缀：System + OpenAI Tool JSON + Skill Catalog]  ← 长期命中
+[中间历史：summary_vN + 未压缩的封闭消息]              ← 低频变化
+[动态末尾：本轮 Query + Tool Result + Retrieval]       ← 高频追加
 ```
 
 具体策略：
@@ -1122,11 +1141,11 @@ artifacts: 可再读取的外部内容引用
 1. **前缀不变性**：系统指令、Tool Schema 的字节内容和排序都要确定，不注入时间戳、随机 ID 等动态字段；
 2. **分段压缩**：只压缩一个已封闭的旧历史段，不每轮重新摘要整段会话；
 3. **摘要冻结**：生成 `summary_vN` 后保持不变，直到下一次跨越 hard waterline 才生成 `summary_vN+1`；
-4. **块级 Cache**：新摘要会使变化点之后的 KV 失效，但 PagedAttention + vLLM APC 仍可保留和复用变化点之前的完整稳定 Block；
+4. **块级 Cache**：新摘要会使变化点之后的 KV 失效，但 PagedAttention + vLLM APC 仍可保留和复用变化点之前连续不变的完整 Block；
 5. **低频压缩**：使用水位和滞回区间，例如超过 80% 时压到 55%，避免在阈值附近每轮抖动；
 6. **按实测优化**：同时记录 compression latency、压缩后输入 Token、prefix cached tokens 和任务质量，而不是只追求命中率。
 
-PagedAttention 为 KV Block 的独立保留、引用和回收提供存储基础，vLLM APC 则用 Block Hash 查找可复用前缀。例如压缩前为 `Stable + H1 + H2 + Recent`，压缩后变为 `Stable + summary_v1 + Recent`：第一次压缩后，APC 仍可复用 `Stable`；`summary_v1` 冻结后，后续轮次又能复用 `Stable + summary_v1`。变化后的摘要与旧历史 Token 不同，其 KV 仍须重新计算。
+PagedAttention 为 KV Block 的独立保留、引用和回收提供存储基础，vLLM APC 则用 Block Hash 查找可复用前缀。例如压缩前为 `Prefix + H1 + H2 + Tail`，压缩后变为 `Prefix + summary_v1 + Tail`：第一次压缩后，APC 仍可复用 `Prefix`；`summary_v1` 冻结后，后续轮次又能复用 `Prefix + summary_v1`。变化后的摘要与旧历史 Token 不同，其 KV 仍须重新计算。
 
 最终目标不是让压缩永远不产生 Cache Miss，而是让大部分轮次只在最近层追加；跨越水位时只改写历史层并承担一次局部重算，随后冻结新摘要，重新建立可持续命中的前缀。
 
@@ -1171,6 +1190,8 @@ RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 
 
 BM25 基于词项匹配，特别擅长处理专有名词、缩写、型号、代码符号和准确关键词。常用形式为：
 
+工业实现通常以 **Lucene** 为倒排内核，通过 **Elasticsearch** 或 **OpenSearch** 提供分词、BM25 打分、过滤和索引运维能力。
+
 $$
 score(D,Q)=\sum_{q_i\in Q} IDF(q_i)\cdot
 \frac{f(q_i,D)(k_1+1)}
@@ -1187,6 +1208,8 @@ BM25 的弱点是无法自然识别同义改写。「显存溢出」和「GPU OO
 ### 4.5.3 Embedding 向量召回
 
 向量召回将 Query 与 Chunk 编码到同一向量空间，通过 cosine similarity 或 inner product 检索语义近邻。大规模索引通常使用 HNSW、IVF 等 ANN 结构，用少量精度换取检索速度。
+
+工业上可用 OpenAI 的 `text-embedding-3-small` 处理高吞吐、成本敏感检索，或用 `text-embedding-3-large` 获得更强的多语言语义表征；向量可存入 **Milvus**、Elasticsearch `dense_vector` 或 **pgvector**，并以 HNSW / IVF 完成 ANN 检索。
 
 工程上要注意：
 
@@ -1572,22 +1595,15 @@ expected_output
 
 ```json
 {
-  "type": "function_call",
-  "name": "task_decomposition",
-  "arguments": {
-    "tasks": [
-      {
-        "title": "分析 parser 失败原因",
-        "instruction": "检查 parser 模块及相关测试，定位失败根因。",
-        "expected_output": "根因、证据和可能的修复方向"
-      },
-      {
-        "title": "检查兼容性",
-        "instruction": "检查当前修改是否影响数据库时间字段兼容性。",
-        "expected_output": "兼容性风险和相关代码位置"
-      }
-    ]
-  }
+  "role": "assistant",
+  "tool_calls": [{
+    "id": "call_tasks_1",
+    "type": "function",
+    "function": {
+      "name": "task_decomposition",
+      "arguments": "{\"tasks\":[{\"title\":\"分析 parser 失败原因\",\"instruction\":\"检查 parser 模块及相关测试，定位失败根因。\",\"expected_output\":\"根因、证据和可能的修复方向\"},{\"title\":\"检查兼容性\",\"instruction\":\"检查当前修改是否影响数据库时间字段兼容性。\",\"expected_output\":\"兼容性风险和相关代码位置\"}]}"
+    }
+  }]
 }
 ```
 
@@ -1656,11 +1672,15 @@ Workspace 读取
 
 ```json
 {
-  "type": "function_call",
-  "name": "collect_tasks",
-  "arguments": {
-    "task_ids": ["task_1", "task_2"]
-  }
+  "role": "assistant",
+  "tool_calls": [{
+    "id": "call_collect_1",
+    "type": "function",
+    "function": {
+      "name": "collect_tasks",
+      "arguments": "{\"task_ids\":[\"task_1\",\"task_2\"]}"
+    }
+  }]
 }
 ```
 
