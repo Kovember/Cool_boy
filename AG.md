@@ -526,57 +526,69 @@ Context → Model → Tool Call
 
 ### 工具完成如何驱动下一轮：异步通知
 
-模型一次可以输出多个带 `tool_call_id` 的 Tool Call，但它不会观察工具执行过程。Harness 为同一轮调用创建 `step_id`，并为每个 Tool Call 持久化状态；状态表是事实来源：
+模型一次可以输出多个 Tool Call，但它不会观察执行过程。Harness 必须异步执行 Tool / Subagent：任务运行时挂起当前协程，结果到达后再通过事件唤醒；如果同步阻塞或持续轮询，会长期占用线程、连接与计算资源。
 
 ![Agent Harness 异步 Tool Call 通知机制](figures/agent-harness-async-tool-notification.png)
 
-```text
-tool_call_id | step_id | tool_name | status  | result / error | deadline
-call_search  | step_7  | search    | RUNNING | —              | ...
-call_read    | step_7  | read_file | SUCCEEDED | {...}        | ...
-```
+| 任务类型 | 实现方式 | 适用场景 |
+|---|---|---|
+| 短任务 | Async I/O：`await`、Event Loop、I/O 多路复用、Future/Promise 完成事件 | Web API、RPC、数据库查询、搜索等秒级任务 |
+| 长任务 | MQ / Durable Task：任务持久化后由 Worker 消费，完成后投递 Result Event | Browser、Sandbox、Deep Research、大文件处理等长耗时任务 |
 
 ```text
-模型输出多个 Tool Call
-→ Harness 协程创建任务，落库：PENDING，并向 Tool Command Topic 投递 tool_call.created
-→ Harness 协程注册 step_id 的完成事件，进入 WAITING_TOOL_RESULTS 后挂起
-→ Tool Executor Consumer Group 消费命令，原子领取：PENDING → RUNNING
-→ Executor 调用真实 Tool / MCP / Subagent，写回 SUCCEEDED / FAILED / TIMEOUT + Result
-→ Executor 向 Tool Result Topic 投递 tool_call.finished（thread_id, step_id, tool_call_id）
-→ Runtime / Result Aggregator 消费完成事件，唤醒该 step 对应的 Harness 协程
-   ├─ 仍有 RUNNING：协程再次挂起
-   └─ 全部终态 / 到达总 deadline：查询状态表、按 tool_call_id 收集结果，进入下一轮 Model Call
+短任务：Harness await Tool → 协程挂起 → I/O Ready 事件 → 唤醒并返回 Result
+
+长任务：Harness 记录 PENDING → 投递 MQ → Worker 执行
+       → 写回终态并投递 Result Event → 唤醒 Harness
 ```
 
-```text
-Harness Thread。                  MQ                         Tool Executor
-─────────────────                 ──                         ─────────────
-创建 ToolTask + 注册等待器
-投递 Tool Command        ───→    Command Topic       ───→   消费并执行 Tool
-await step_finished()                                      →   写回状态 + Result
-                                  Result Topic        ←───   投递完成事件
-消费完成事件             ←───
-查询 step 状态
-  ├─ 未收齐：再次 await
-  └─ 已收齐：按 tool_call_id 回填结果 → Model
-```
+#### 短任务：Async I/O 足够
+
+Web API、RPC、数据库查询等任务通常在一个连接生命周期内结束。Harness 调用 `await tool.execute()` 后，协程会让出执行权，由 Event Loop 继续调度其他 Thread；底层 I/O Ready 或 Future 完成时，再将原协程放回 Ready Queue。这里“挂起”的是协程，不是阻塞 OS Thread，因此一个 Runtime 可以同时承载大量等待中的 Tool Call。
 
 ```python
-async def wait_tool_batch(thread_id, step_id):
-    subscription = mq.subscribe(
-        topic="tool_call.finished",
-        key=f"{thread_id}:{step_id}",
-        durable=True,
-    )  # 先订阅 Result Topic，再投递 Tool Command
-    while True:  # 每次循环由完成事件唤醒，不是主动轮询
-        await subscription.next()
-        calls = state_store.list_tool_calls(step_id)
-        if all(call.status in TERMINAL for call in calls):
-            return to_tool_messages(calls)  # 保留 tool_call_id
+async def run_short_tool(call):
+    state_store.mark_running(call.id)
+    try:
+        result = await asyncio.wait_for(
+            tool_executor.execute(call), timeout=call.timeout
+        )
+        state_store.mark_succeeded(call.id, result)
+    except asyncio.TimeoutError:
+        state_store.mark_timeout(call.id)
+    except Exception as error:
+        state_store.mark_failed(call.id, error)
+    finally:
+        completion_event.notify(call.step_id, call.id)
 ```
 
-状态表记录事实，MQ  负责投递命令与完成通知；消息重复时按 `thread_id + step_id` 幂等检查即可。
-正常结果回传不轮询；仅由独立的**低频定时扫描器**兜底检查超时、过期租约或通知丢失，并将对应任务标记为 `TIMEOUT`、重试或故障接管。
+#### 长任务：MQ 完全解耦
+
+Browser、Sandbox、Deep Research 或大文件处理可能运行数分钟甚至更久。如果 Harness 一直维持 HTTP / RPC 连接，容易受到连接超时、实例重启和扩缩容迁移影响。更稳妥的方式是先持久化 Task，再投递 Command；Worker 独立消费和执行，完成后写回状态并投递 Result Event。Harness 可以释放当前请求资源，之后由完成事件重新调度对应 Thread。
+
+```text
+Harness：Task=PENDING → Command Queue
+Worker ：消费 Command → RUNNING → 执行 → 写 Result / 终态
+Worker ：Result Event Queue → Runtime 唤醒对应 Thread
+```
+
+MQ 在这里不仅负责通知，还提供生产者与 Worker 的完全解耦、任务持久化、失败重试和削峰填谷。流量突增时任务先在队列中积压，Worker 按自身并发能力平稳消费，不会把压力直接传到 Tool 服务。
+
+#### 多个结果如何收敛：Barrier / Join
+
+同一轮多个 Tool Call 共享 `step_id`，每个调用使用独立 `tool_call_id`。任一完成事件都会唤醒 Harness 检查批次状态；还有 `PENDING / RUNNING` 就继续挂起，全部进入终态后，才按 `tool_call_id` 收集 Result 并开始下一轮 Model Call。Subagent 同理，只是聚合键从 Tool Batch 换成父任务下的 `task_id` 集合。
+
+#### 心跳：只负责异常兜底
+
+无论走哪条路径，Tool / Task 都应记录 `PENDING → RUNNING → SUCCEEDED / FAILED / CANCELLED / TIMEOUT`，长任务 Worker 还要定期更新 `last_heartbeat`。后台心跳任务周期检查：
+
+```text
+now > deadline                   → TIMEOUT
+now - last_heartbeat > threshold → Worker 失联，取消 / 重试 / 故障接管
+状态已终结但通知未消费           → 补发完成事件
+```
+
+正常结果依靠事件通知立即返回；心跳扫描只处理超时、失联、通知丢失等异常，不让每个 Harness Thread 自己轮询任务状态。
 
 ### 用户打断：取消而不是等待自然结束
 
@@ -1671,7 +1683,7 @@ run_tasks: queued
 Subagent A      Subagent B      Subagent C
 ```
 
-子任务和 Tool Call 使用同一套收敛思路：Lead Agent 的 Harness 协程创建 `run_tasks`（`queued → running → completed / failed / timeout`）并挂起等待；Subagent 完成后写入结果、投递 `subtask.finished` 事件，Runtime 消费事件后唤醒父任务。Lead 按 `parent_task_id` 查询本轮所有子任务；尚未结束则再次挂起，满足 `wait_all`、总 deadline 或“关键子任务完成”等 join 条件时，才将各 `task_id` 对应结果汇总进 Lead 的下一轮 Context。正常结果回传不靠 Lead 主动轮询；轮询仅用于超时、租约过期和通知丢失的故障兜底。
+Subagent 与 Tool 共用同一套异步机制：短子任务可由 Harness 异步调度并等待完成事件；长子任务持久化后交给 MQ / Durable Worker。Subagent 完成后发送 Result Event 唤醒 Lead，Lead 在 Join 条件满足后汇总结果；后台心跳只负责发现超时、失联和异常任务，不承担正常结果轮询。
 
 ## 6.1 Subagent 独立执行
 
