@@ -162,7 +162,7 @@ if needs_subagent:
 一次 Agent Turn 可以概括为三个过程：
 
 ```text
-Thread State + User Memory + Environment
+Environment（Thread State + Tool Results）+ Memory / RAG
     → Context Builder → 模型输入上下文
     读取、选择、压缩并冻结
 
@@ -574,7 +574,7 @@ Worker ：Result Event Queue → Runtime 唤醒对应 Thread
 
 MQ 在这里不仅负责通知，还提供生产者与 Worker 的完全解耦、任务持久化、失败重试和削峰填谷。流量突增时任务先在队列中积压，Worker 按自身并发能力平稳消费，不会把压力直接传到 Tool 服务。
 
-#### 多个结果如何收敛：Barrier / Join
+#### 多个结果如何收敛：Join
 
 同一轮多个 Tool Call 共享 `step_id`，每个调用使用独立 `tool_call_id`。任一完成事件都会唤醒 Harness 检查批次状态；还有 `PENDING / RUNNING` 就继续挂起，全部进入终态后，才按 `tool_call_id` 收集 Result 并开始下一轮 Model Call。Subagent 同理，只是聚合键从 Tool Batch 换成父任务下的 `task_id` 集合。
 
@@ -604,12 +604,34 @@ User Stop → Thread: CANCELLING → 取消模型流 / Tool / Subagent
 
 ```text
 Resume / 故障恢复
-→ 加载和恢复最近 Checkpoint（Thread State + Context）
-→ Context Builder 重建模型输入
+→ 加载最近一致的 Checkpoint
+→ 核验未终态 Tool / Task 的真实执行结果
+→ Context Builder 按保存的 Context Snapshot 重建模型输入
 → Agent Loop 从上次中断处继续
 ```
 
-写操作若处于未知状态，再用幂等键或外部资源 ID 做一次核验，避免重复执行即可。
+#### Checkpoint 的本质：State + Context Snapshot
+
+Checkpoint 不是只存聊天历史；它是在稳定边界把 Runtime State 与当时的 Context Snapshot 一起持久化：
+
+```text
+Model / Tool / Subagent
+        ↓
+Event Log / Artifact Store（追加式事实历史）
+        ↓ State Reducer
+Harness Runtime State
+├─ Tool / Task 状态、Tool Results
+├─ Artifact / Evidence 引用、外部 task_id / idempotency_key
+└─ Goal / Plan、step、retry、budget、event cursor
+        ↓ 稳定边界持久化
+Checkpoint Store
+├─ Runtime State Snapshot
+└─ Context Snapshot
+```
+
+Context 可以压缩，因为它只是模型当前视图；原始 Message、Tool Result 与证据仍留在 Event Log / Artifact Store。Summary 记录覆盖的 Event Range 与 Artifact 引用，模型或人工需要回看细节时可按需展开。
+
+恢复时加载 Snapshot：已完成的 Tool 复用结果；`RUNNING` / 状态未知的调用用 `tool_call_id`、幂等键或外部 `task_id` 核验，不能盲目重投。也就是：**恢复 State，重建 Context，核验在途操作，再从最后一个确定边界继续 Loop。**
 
 Agent 的“自驱”即：**事件到达时继续，取消到达时停止，恢复请求到达时从持久状态继续。**
 
@@ -680,6 +702,37 @@ Harness 从 Tool Registry 读取名称、描述和 JSON Schema，并按 OpenAI `
 ```
 
 在不同 Provider API 中，Tool definitions 可能位于单独的 `tools` 字段，而不是普通消息文本中；但从模型的有效 Context 看，它们共同定义了“有哪些动作可用、参数应该长什么样”。
+
+### Tool 太多时：用 `tool_search` 渐进召回
+
+Tool 并非越全量注入越好。数百个 Tool 的名称、描述和 JSON Schema 会挤占 Context、增加首 Token 延迟，也会让模型在相似工具间选错。此时保留少量高频核心 Tool，并把 `tool_search` 作为一个始终可见的元工具：模型先描述“需要什么能力”，Harness 再从 Registry 召回少量候选。
+
+```text
+初始 Context：核心 Tool + tool_search
+        ↓
+Model → tool_search(query, capability, constraints)
+        ↓
+Harness：检索 Tool Catalog + ACL / 环境 / 风险过滤
+        ↓
+Tool Result：候选名称、用途、限制、简短参数摘要
+        ↓
+Context Builder：将选中 Tool 的完整 JSON Schema 加入下一轮 tools 字段
+        ↓
+Model → 已加载 Tool 的普通 Function Call
+```
+
+例如模型初始只看得到：
+
+```json
+{
+  "name": "tool_search",
+  "arguments": "{\"query\":\"查询本地代码仓库中的文件内容\",\"top_k\":3}"
+}
+```
+
+Harness 可以用名称、说明、标签、输入输出类型做关键词 / Embedding 混合检索，并先按用户权限、当前 Workspace、运行环境和风险等级过滤。返回 `read_file`、`search_code` 等候选后，**不能只把工具名写进 Tool Result 就允许调用**：Harness 必须在下一轮 Model Call 的 OpenAI `tools` 字段中注册被选中的完整 Schema，模型才真正获得可调用能力。
+
+`tool_search` 只负责能力发现，不是权限边界，也不直接执行被召回的 Tool。候选数量应有限（如 Top-3～5），Active Tool Set 可随任务切换；高风险 Tool 即使被检索到，仍要经过后续的 Policy 与 Approval。
 
 ### 第二层：模型返回 function_call JSON
 
@@ -769,9 +822,10 @@ Resolve
 → Validate
 → Policy Check
 → Approval
+→ Admission Guard（Quota / Concurrency / Budget / Duplicate）
 → Ledger Started
-→ Execute
-→ Normalize
+→ Execute（Deadline + Cancellation）
+→ Normalize + Result Validate
 → Ledger Completed
 → Audit
 → Tool Result
@@ -796,9 +850,13 @@ class ToolExecutor:
                 if not allowed:
                     return error_result(call.id, "rejected by user")
 
+            self.admission.check(call, context)  # 配额、并发、预算、重复调用
             self.ledger.started(call)
-            raw = await tool.execute(args, context)
+            raw = await run_with_deadline(
+                tool.execute(args, context), context.deadline, context.abort_signal
+            )
             result = normalize(raw)
+            validate_result(tool.output_schema, result)
             self.ledger.completed(call, result)
             return tool_result(call.id, result)
 
@@ -807,29 +865,71 @@ class ToolExecutor:
             return error_result(call.id, str(exc))
 ```
 
-### 失败分类、重试与 Fallback
+### 生产级 Tool 调用兜底
 
-Tool 失败后不能一律重试，也不能一律让模型重新决定。Harness 应先判断失败类别：
+生产级兜底的关键是：**模型只提出调用意图；是否重试、能等多久、何时停止，均由 Tool Registry 的策略和 Harness 决定。**模型最多收到结构化结果，再据此重新规划，不能自行无限重试。
 
-| 失败类型 | 典型情况 | 默认处理 |
-|---|---|---|
-| 参数或策略错误 | Schema 不合法、无权限、用户拒绝审批 | 直接返回错误 Tool Result，让模型调整方案 |
-| 可重试的暂时错误 | 超时、限流、网络抖动、5xx | 有上限地重试，并使用指数退避与抖动 |
-| 已知安全的替代路径 | 主搜索服务不可用，备用搜索服务可用 | 按预设 fallback chain 调用等价工具 |
-| 副作用状态未知 | 发送邮件后连接中断、支付请求超时 | 不能盲目重试；先查 Tool Ledger 或外部资源状态 |
+#### 1. 哪些 Tool 可以重试？由谁决定超时和次数？
 
-一个安全的规则是：**只有只读调用，或携带同一 idempotency key 的写调用，才可以自动重试。** 如果无法判断外部副作用是否已发生，应保留失败状态并要求模型或用户决定下一步。
+每个 Tool 在注册时都要声明副作用和执行策略；Tool Owner 根据下游 SLA、业务风险和是否支持幂等来配置默认值，Harness / Tool Executor 在运行时统一执行。模型不决定 timeout 或 retry 次数，也不能通过参数绕过策略。
 
-```text
-web_search 超时
-→ 重试 2 次
-→ 主服务仍不可用
-→ 调用预先定义的备用搜索服务
-→ 记录 attempts、实际使用的 provider 和结果
-→ 作为同一次 Tool Call 的结果返回模型
+```python
+ToolPolicy(
+    readonly=True,
+    idempotency="none",          # none / required / supported
+    timeout_seconds=10,
+    max_retries=2,
+    retryable_errors={429, 502, 503, 504, "network_timeout"},
+)
 ```
 
-Fallback 是 Harness 的确定性策略，不应靠模型在错误发生后“猜一个相似工具”。每次尝试、回退与最终结果都要进入 Tool Ledger；模型收到的 Tool Result 至少应说明 `error_code`、是否 `retryable`、已尝试次数和实际执行的工具。这样模型既能继续规划，系统也能回放和审计。
+可以按下面三类回答：
+
+| Tool 类型 | 例子 | 超时后默认动作 |
+|---|---|---|
+| 只读、天然幂等 | `search`、`read_file`、`get_order_status` | 对网络抖动、限流、部分 5xx 做有限重试 |
+| 有副作用，但支持幂等键 | `create_order(request_id)`、`send_message(idempotency_key)` | 先按 key / operation ID 查状态；确认未执行或服务端保证去重后才重试 |
+| 有副作用且无法确认幂等 | `charge_card`、不可逆删除、部分外部写接口 | 不自动重试；返回“执行状态未知”或请求用户确认 |
+
+重试还要区分**错误是否短暂**。`429`、网络断连、`502/503/504` 常是临时故障，可按指数退避加抖动重试；Schema 错误、无权限、业务规则拒绝等是确定性错误，重试没有价值，应直接把精简错误返回模型修正。`404` 通常不可重试，但最终一致性场景可由该 Tool 明确标记为短暂错误。
+
+Timeout 也不是模型说了算。Registry 定义单次调用的默认上限，Runtime 再给整个 Turn / Task 设置总 Deadline；一次调用的重试只能使用剩余时间。比如 `web_search` 单次 5 秒、最多 2 次，但本轮只剩 6 秒时，Harness 不会再完整执行两轮 5 秒请求。用户 Stop 或父 Task 取消时，Harness 向 Tool、子进程和 Subagent 传播取消信号；外部请求取消可能只是 best-effort，最终仍以 Tool Ledger 或外部 `operation_id` 查询结果为准。
+
+```text
+write_tool 超时
+→ 有 idempotency_key？
+   ├─ 有：query_status(key) → 已成功则复用；未执行才重试
+   └─ 无：标记 UNKNOWN_SIDE_EFFECT，不盲目重放
+```
+
+重试应由最了解下游幂等语义的 Tool Executor 统一负责，消耗同一份 retry budget。不能让 SDK、MCP Client、Executor 和 Agent Loop 都各重试几次，否则一次故障会被倍数放大。
+
+#### 2. 模型一直 Loop 调用 Tool 怎么办？
+
+`max_steps` 是最后保险，但不足以阻止资源浪费：模型可能在一个 Step 内并发很多 Tool，也可能反复 `search(A)`，或在 `read(A) → read(B) → read(A)` 之间循环。Harness 因此在每个 Run 维护调用窗口和预算，而不是等模型自己意识到出错。
+
+```text
+每次 Tool Call
+→ 记录 tool_name + arguments_hash + result_hash
+→ 检查本 Run 的相同调用次数、循环模式、总调用数与总耗时
+   ├─ 首次 / 有新参数或新结果：允许执行
+   ├─ 相同 Tool + 相同参数 + 相同结果重复 N 次：拒绝执行
+   └─ 达到调用 / Step / 时间 / Token / 成本预算：结束或降级
+```
+
+重复调用不应简单抛 Python Exception，而应返回模型可理解的 Observation：
+
+```json
+{
+  "status": "blocked",
+  "error_code": "RepeatedToolCall",
+  "message": "web_search with identical arguments already returned the same result twice; choose a different query or strategy."
+}
+```
+
+模型收到后可以改写 Query、切换 Tool、基于已有证据回答，或向用户说明限制；若仍继续重复，Harness 的 `max_tool_calls`、`max_steps`、`max_wall_time`、`max_tokens / cost` 会作为最终硬上限终止 Run。`Circuit Breaker` 是另一回事：它针对某个下游 Tool / 服务池整体不健康而暂停调用；单个 Agent Run 的重复调用属于 Loop Detection。
+
+最后，所有决定都写入 Tool Ledger / Trace：`tool_call_id`、policy、deadline、attempt、idempotency_key、错误类别、Loop 拦截原因和最终状态。这样可以解释“为什么没重试”“为什么被阻断”，也能调优每类 Tool 的超时与预算。
 
 **源码对照：** Pi 的 [Extensions 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)、[Permission Gate](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/permission-gate.ts) 和 [Protected Paths](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/protected-paths.ts) 适合对照 `before_tool`、权限拦截与受保护路径。
 
@@ -1077,28 +1177,6 @@ Tool Schema
 2. **约束解码能保证 Tool Call 正确吗？**
    只能保证语法和部分 Schema 约束，不能保证工具选择、业务语义、资源存在性和操作权限。
 
-## 3.8 异常分类、重试与兜底
-
-| 错误类型 | 例子 | 处理 |
-|---|---|---|
-| Validation | JSON 不合法、字段缺失 | 将精简错误返回模型修复，限制 1–2 次 |
-| Permission | 越权路径、未批准副作用 | 不重试，请求批准或拒绝 |
-| Transient | 429、502、短暂网络超时 | 指数退避 + jitter，遵守 `Retry-After` |
-| Timeout | 模型或 Tool 超时 | 取消下游，仅对幂等操作重试 |
-| Permanent | 资源不存在、Schema 版本不兼容 | 立即失败，切换替代路径 |
-| Unknown Side Effect | 请求已发送但结果丢失 | 先用幂等键/外部 ID 查询，禁止盲目重放 |
-| Model Refusal/Empty | 拒答或空响应 | 记录 finish reason，收紧任务或切换允许的 fallback |
-
-重试必须有总预算，避免每层各重试 3 次导致放大。一般由最靠近错误、且拥有幂等信息的层负责重试。Fallback 也要有能力契约：替代模型是否支持工具、上下文窗口和约束解码，替代工具是否有相同副作用语义，都应在注册时声明。
-
-**常见问题**
-
-1. **哪些错误适合自动重试？**
-   仅限短暂性且幂等的错误，如 429、502 和部分网络超时；权限错误和未知副作用不能盲目重试。
-2. **为什么不让每一层都自行重试？**
-   多层重试会乘法放大请求数，应由最靠近错误且知道幂等语义的一层统一消费重试预算。
-
-
 # 四、Context Engineering
 
 Context Engineering 解决的核心问题是：
@@ -1109,10 +1187,11 @@ Context 不是持久状态本身，而是 Harness 从各类状态与数据源中
 
 ## 4.1 Context Builder：从状态构造本轮输入
 
-Thread、Memory、Workspace 和检索结果是持久状态或外部数据，Context 只是模型本轮看到的快照。Context Builder 负责：
+Environment 汇总本轮运行环境，包括 Thread State、Tool Results 和 Workspace 状态；Memory / RAG 提供长期记忆与检索信息。Context 只是 Context Builder 从这些来源中构造出的本轮模型输入快照：
 
 ```text
-Thread State + User Memory + Environment / Retrieval
+Environment（Thread State + Tool Results + Workspace）
+                  + Memory / RAG
                          ↓
        Select → Deduplicate → Compress → Order → Budget
                          ↓
@@ -1358,53 +1437,54 @@ def rrf(rank_lists, k=60):
 
 Memory 不是 Context 的同义词，也不是脱离 Thread 的“第二个大脑”。在本文架构中：
 
-> **Memory 属于用户级全局持久化数据，可以跨 Thread 复用；Goal、Plan、Task 属于单个 Thread 的 Durable State。模型通过 Tool-call 访问 User Memory（如`memory_search` 和 `memory_write`），Context Builder 也可以在模型调用前自动检索 Memory。**
+> **Memory 属于用户级全局持久化数据，可以跨 Thread 复用；Goal、Plan、Task 属于单个 Thread 的 Durable State。Memory 同时支持 Harness 自动读写和模型通过 Tool 主动读写，两条路径共用权限、证据、Scope、去重与冲突处理。**
 
 ```mermaid
 flowchart TB
-    subgraph PASSIVE["被动路径：模型调用前自动注入"]
+    subgraph AUTO["Harness 自动读写"]
         direction LR
+        EVENT["Turn / Task Event"] --> EXTRACT["抽取、校验与去重"]
+        EXTRACT --> STORE1[("User Memory")]
         INPUT1["当前任务"] --> CB["Context Builder"]
-        CB --> STORE1[("User Memory")]
+        CB --> STORE1
         STORE1 --> SELECT["检索与筛选"]
         SELECT --> CTX["Model Context"]
-        CTX --> MODEL1["Model"]
     end
 
-    subgraph ACTIVE["主动路径：模型推理中按需查询"]
+    subgraph ACTIVE["模型通过 Tool 主动读写"]
         direction LR
-        MODEL2["Model"] --> CALL["memory_search"]
+        MODEL2["Model"] --> CALL["memory_search / memory_write"]
         CALL --> TOOL["Harness / Memory Tool"]
         TOOL --> STORE2[("User Memory")]
         STORE2 --> RESULT["Tool Result"]
         RESULT --> MODEL2
     end
 
-    MODEL1 ~~~ MODEL2
+    CTX ~~~ MODEL2
 
     classDef store fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.4px;
     classDef process fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.4px;
     classDef context fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
     classDef model fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
     class STORE1,STORE2 store;
-    class SELECT,CALL,RESULT process;
+    class EVENT,EXTRACT,SELECT,CALL,RESULT process;
     class INPUT1,CB,CTX,TOOL context;
-    class MODEL1,MODEL2 model;
+    class MODEL2 model;
 ```
 
-Memory 有两条访问路径：
+两种方式都同时包含读取和写入：
 
 ```text
-被动路径
-Context Builder → 按 user_id 检索 User Memory → 选中少量内容 → 模型输入上下文
+Harness 自动读写
+读取：Context Builder → 检索 User Memory → 筛选少量内容 → Model Context
+写入：Turn / Task Event → 抽取候选 → 校验、去重与冲突处理 → User Memory
 
-主动路径
-Model → memory_search function_call JSON
-      → Harness → MemoryTool.execute(args, context)
-      → Tool Result → 下一轮 Context
+模型通过 Tool 主动读写
+读取：Model → memory_search → Harness / Memory Tool → Tool Result
+写入：Model → memory_write → Harness 校验 → User Memory → Tool Result
 ```
 
-被动路径适合稳定偏好和明显相关的项目事实；主动路径适合模型在推理中发现“还缺少过去决策或经验”时进行定向查询。
+Harness 自动读取适合稳定偏好和明显相关的项目事实，自动写入适合从每轮新增 Context 与 Event 中持续沉淀长期信息。模型主动读取适合推理中临时发现缺少历史决策或经验；主动写入适合用户明确要求记住、形成稳定决策或完成已验证流程。模型可以决定读写什么，但真正的访问仍由 Harness 执行和约束。
 
 ### 4.6.1 User Memory 的内部层次
 
@@ -1438,6 +1518,8 @@ memory_write({
 })
 ```
 
+`memory_search` 和 `memory_write` 都是模型可见的 Tool；Harness 从 `ToolContext` 注入用户、Thread 和 ACL，并在真正访问 Memory Store 前统一校验。
+
 对应的 Python 函数原型可以非常简单：
 
 ```python
@@ -1451,7 +1533,7 @@ def memory_search(
     kinds: list[MemoryKind] | None = None,
     top_k: int = 5,
 ) -> list["MemoryItem"]:
-    """只搜索当前 ToolContext.thread_id 对应的 Thread Memory。"""
+    """在 ToolContext.user_id 对应的 User Memory 中检索。"""
     ...
 
 
@@ -1462,7 +1544,7 @@ def memory_write(
     evidence_event_ids: list[str],
     confidence: float = 0.8,
 ) -> "MemoryItem":
-    """向当前 Thread 写入带来源与版本的 Memory。"""
+    """校验并写入带来源与版本的长期记忆。"""
     ...
 ```
 
@@ -1471,20 +1553,24 @@ def memory_write(
 ### 4.6.3 Memory Write Pipeline
 
 ```text
-Candidate Extraction
+Turn / Task / Confirmed Decision Event
+→ Candidate Extraction（规则或模型抽取）
 → Evidence Validation
 → 稳定性判断
 → 去重 / 冲突检测
-→ Thread Scope 与 ACL
+→ User Scope 与 ACL
 → 人工确认（必要时）
 → 持久化与版本化
 ```
+
+Harness 自动写入会从 Turn / Task Event 开始执行完整流水线；模型调用 `memory_write` 时从候选记忆进入，但同样不能绕过证据、Scope、去重与冲突校验。生产系统还可以通过规则直接捕获高置信事件，例如用户显式修改偏好、确认长期约束或将方案标记为已验证。
 
 ```python
 @dataclass
 class MemoryItem:
     id: str
-    thread_id: str
+    user_id: str
+    source_thread_id: str
     kind: MemoryKind
     content: str
     source_event_ids: list[str]
