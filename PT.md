@@ -10,9 +10,7 @@
 
 #### 1.1 MLP—固定窗口的映射
 
-对于固定窗口大小为 $T$ 的输入序列 $X = [x_1, x_2, ..., x_T] \in \mathbb{R}^{T \times d}$，MLP 将每个位置独立处理：
-
-输入窗口长度固定，需展平为 $\mathrm{vec}(X) \in \mathbb{R}^{Td}$：
+对于固定窗口大小为 `T` 的输入序列 `X = [x_1, x_2, ..., x_T] ∈ R^{T × d}`，MLP 先将窗口展平为 `vec(X) ∈ R^{Td}`，再统一映射：
 
 $$
 y = \sigma(W \cdot \mathrm{vec}(X) + b)
@@ -26,7 +24,7 @@ $$
 
 #### 1.2 RNN—状态递归
 
-$h_t$ 表示当前时间步的隐状态，$x_t$ 表示当前输入：
+`h_t` 表示当前时间步的隐状态，`x_t` 表示当前输入：
 
 $$
 h_t = \tanh(W_h h_{t-1} + W_x x_t + b)
@@ -51,31 +49,21 @@ $$
 
 Transformer的端到端模型：
 
-- **Token 嵌入**：将输入 token 映射为稠密向量
+- **Token Embedding**：从可学习表中查出每个 Token 的向量：
 
 $$
 \mathbf{X}_{\mathrm{token}} = \mathrm{Lookup}(E, \mathrm{tokens}), \quad E \in \mathbb{R}^{V \times d_{\mathrm{model}}}
 $$
 
-- **位置编码**：注入序列顺序信息
+- **位置编码**：把顺序信息注入 Token 表示：
 
 $$
 \mathbf{X} = \mathbf{X}_{\mathrm{token}} + \mathbf{P}, \quad \mathbf{P} \in \mathbb{R}^{T \times d_{\mathrm{model}}}
 $$
+- **Self-Attention**：让每个 Token 从允许访问的其他 Token 中聚合信息；
+- **Multi-Head Attention**：多个头分别学习不同关系，拼接后再做一次线性映射；
 
-- **缩放点积注意力**：
-
-$$
-\mathrm{Attn}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
-$$
-
-- **多头注意力**：
-
-$$
-\mathrm{MultiHead}(\mathbf{X}) = \mathrm{Concat}(\mathrm{head}_1,...,\mathrm{head}_h)W^O,\quad \mathrm{head}_i = \mathrm{Attn}(\mathbf{X}W_i^Q,\ \mathbf{X}W_i^K,\ \mathbf{X}W_i^V)
-$$
-
-- **前馈层（FFN）**：$\mathrm{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2$ 或写作 $\mathrm{FFN}(x) = \mathrm{ReLU}(xW_1 + b_1)W_2 + b_2$
+- **前馈层（FFN）**：`FFN(x) = max(0, xW_1 + b_1)W_2 + b_2` 或写作 `FFN(x) = ReLU(xW_1 + b_1)W_2 + b_2`
 
 ### 2 Transformer 的架构组成
 
@@ -99,13 +87,10 @@ $$
 
 1. **Sinusoidal（正弦/余弦）编码**（原始 Transformer）
 
-$$
-PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{model}}}\right),\quad
-PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{model}}}\right)
-$$
+不同维度使用不同频率的正弦和余弦表示位置：低频维度描述大范围位置，高频维度区分邻近位置。无需背具体公式。
 
 - 优点：可以外推到比训练时更长的序列；无需额外参数。
-- **Why 用 sin/cos？** 使得对于任意偏移量 $k$，$PE_{pos+k}$ 可以表示为 $PE_{pos}$ 的线性变换，便于模型学习相对位置。
+- **Why 用 sin/cos？** 使得对于任意偏移量 `k`，`PE_{pos+k}` 可以表示为 `PE_{pos}` 的线性变换，便于模型学习相对位置。
 
 2. **可学习位置编码**（BERT、GPT 等常用）
 
@@ -116,17 +101,7 @@ $$
 
 3. **RoPE（旋转位置编码）**
 
-- 不是将位置向量加到词向量上，而是通过旋转矩阵对 **Query 和 Key 向量** 施加与位置相关的变换。对于第 $i$ 维子空间，旋转角度为 $\theta_i = \mathrm{base}^{-2i/d}$，位置 $m$ 的变换为：
-
-$$
-f_q(q, m) = q \cdot R_{\theta_i}(m), \quad f_k(k, n) = k \cdot R_{\theta_i}(n)
-$$
-
-其中旋转矩阵为：
-
-$$
-R_{\theta_i}(m) = \begin{pmatrix} \cos m\theta_i & -\sin m\theta_i \\ \sin m\theta_i & \cos m\theta_i \end{pmatrix}
-$$
+- 不是将位置向量加到词向量上，而是按二维一组旋转 **Query 和 Key**。位置越靠后，旋转角度越大；Q、K 内积因此自然包含相对距离 `m-n`。
 
 实际计算中不显式构造矩阵，而是利用复数乘法或按维度公式：
 
@@ -153,7 +128,7 @@ def apply_rotary_emb(x, freqs_cis):
 ```
 
 - **意义**
-  - **相对位置建模**：内积结果 $f_q(q,m) \cdot f_k(k,n)$ 只依赖于 $m-n$。
+  - **相对位置建模**：内积结果 `f_q(q,m) · f_k(k,n)` 只依赖于 `m-n`。
   - **长序列外推友好**：可通过 Position Interpolation 等方法扩展上下文窗口。
   - **无额外参数**：旋转是确定的。
 
@@ -162,7 +137,7 @@ def apply_rotary_emb(x, freqs_cis):
 1. **RoPE 与绝对位置编码（如 Sinusoidal）本质区别？**
    → 绝对位置编码是在输入层加位置向量，RoPE 直接修改 Q/K，使注意力分数隐含相对位置。
 2. **如何用 RoPE 实现 4k → 32k 上下文外推？**
-   → 位置插值（PI）：将位置索引从 $m$ 缩小为 $m \times (L_{\mathrm{train}} / L_{\mathrm{test}})$；NTK-aware scaling：调整 base 值。
+   → 位置插值（PI）：将位置索引从 `m` 缩小为 `m × (L_{train} / L_{test})`；NTK-aware scaling：调整 base 值。
 3. **手写 RoPE 旋转公式（对一对维度）** → 见上方公式。
 
 
@@ -178,17 +153,17 @@ $$
 \mathrm{Attention}(Q, K, V) = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
 $$
 
-- **Q, K, V** 由同一个输入 $X$ 通过三个不同的线性变换得到。
-- **Shape**：假设输入 $X$ 为 `[B, S, D]`，线性变换后依然 `[B, S, D]`。
+- **Q, K, V** 由同一个输入 `X` 通过三个不同的线性变换得到。
+- **Shape**：假设输入 `X` 为 `[B, S, D]`，线性变换后依然 `[B, S, D]`。
   为了多头，后面会切分，但这里先看单头。
 
 **计算过程**：
 
-1. $QK^T$：`[B, S, D]` × `[B, D, S]` → `[B, S, S]`，表示每个位置对其他所有位置的“相似度”。
-2. 除以 $\sqrt{d_k}$（其中 $d_k = D / H$，H 为头数）。
-   - **Why？** 假设 $q, k$ 的每个元素均值为 0，方差为 1，那么 $q \cdot k$ 的方差就是 $d_k$。当 $d_k$ 较大时，点积结果会非常大，导致 softmax 进入饱和区（梯度极小）。除以 $\sqrt{d_k}$ 使方差回到 1，保持梯度稳定。
+1. `QK^T`：`[B, S, D]` × `[B, D, S]` → `[B, S, S]`，表示每个位置对其他所有位置的“相似度”。
+2. 除以 `sqrt(d_k)`（其中 `d_k = D / H`，H 为头数）。
+   - **Why？** 假设 `q, k` 的每个元素均值为 0，方差为 1，那么 `q · k` 的方差就是 `d_k`。当 `d_k` 较大时，点积结果会非常大，导致 softmax 进入饱和区（梯度极小）。除以 `sqrt(d_k)` 使方差回到 1，保持梯度稳定。
 3. softmax 按行（最后一个维度）归一化，得到注意力权重。
-4. 乘以 $V$：`[B, S, S]` × `[B, S, D]` → `[B, S, D]`，加权聚合信息。
+4. 乘以 `V`：`[B, S, S]` × `[B, S, D]` → `[B, S, D]`，加权聚合信息。
 
 **代码（单头）**：
 
@@ -210,8 +185,8 @@ def scaled_dot_product_attention(q, k, v, mask=None):
 
 **实现步骤**：
 
-1. 线性变换得到 $Q, K, V$，形状 `[B, S, D]`。
-2. 将最后一维切分成 $H$ 个头：`[B, S, H, D_k]`（$D = H \times D_k$）。
+1. 线性变换得到 `Q, K, V`，形状 `[B, S, D]`。
+2. 将最后一维切分成 `H` 个头：`[B, S, H, D_k]`（`D = H × D_k`）。
 3. 交换维度，变成 `[B, H, S, D_k]`，方便并行计算。
 4. 对每个头独立做缩放点积注意力，得到 `[B, H, S, D_k]`。
 5. 交换回 `[B, S, H, D_k]`，合并成 `[B, S, D]`。
@@ -252,8 +227,8 @@ def multi_head_attention(x, num_heads, d_model):
 - **Padding Mask**：对输入中的填充位置（如 `[PAD]`）进行屏蔽，防止模型关注它们。
   方法：在 softmax 之前，将对应位置设为 `-inf`（或一个极小的负数），使 softmax 后的权重接近 0。
 
-- **Causal Mask（因果掩码）**：在 Decoder 中，保证位置 $i$ 只能看到位置 $j \leq i$ 的 token，防止“看到未来”。
-  方法：构造一个上三角矩阵（不含对角线），对每个 `(i, j)` 其中 $j > i$ 的位置设为 `-inf`。
+- **Causal Mask（因果掩码）**：在 Decoder 中，保证位置 `i` 只能看到位置 `j ≤ i` 的 token，防止“看到未来”。
+  方法：构造一个上三角矩阵（不含对角线），对每个 `(i, j)` 其中 `j > i` 的位置设为 `-inf`。
 
 **Shape**：通常 mask 是 `[B, 1, 1, S]` 或 `[1, 1, S, S]`，通过广播机制与 `[B, H, S, S]` 对齐。
 
@@ -261,34 +236,24 @@ def multi_head_attention(x, num_heads, d_model):
 
 ##### ① 前馈网络（FFN）
 
-**公式**：
-
 $$
 \mathrm{FFN}(x) = \mathrm{ReLU}(xW_1 + b_1)W_2 + b_2
 $$
 
-- $W_1$ 的形状：`[d_model, d_ff]`，通常 $d_{ff} = 4 \times d_{model}$。
-- $W_2$ 的形状：`[d_ff, d_model]`。
+- `W_1` 的形状：`[d_model, d_ff]`，通常 `d_{ff} = 4 × d_{model}`。
+- `W_2` 的形状：`[d_ff, d_model]`。
 - **Why 需要 FFN？**
   Attention 负责在**不同 token 之间**交换信息（线性加权），FFN 负责在**每个 token 内部**做非线性变换，提升模型表达能力。两者交替，形成了 Transformer 的“通信-计算”结构。
 
-**现代变体**（如 LLaMA 使用 SwiGLU）：
-
-$$
-\mathrm{SwiGLU}(x) = \mathrm{Swish}(xW_1) \odot (xW_2)
-$$
-
-效果更好，但参数略多。
+**现代变体**（如 LLaMA 使用 SwiGLU）：一条分支产生内容，另一条分支产生门控，两者逐元素相乘。它通常比 ReLU FFN 表达能力更强，但参数与计算略多。
 
 ##### ② 残差连接 + 层归一化（Residual + LayerNorm）
-
-**结构**：
 
 $$
 \mathrm{Output} = \mathrm{LayerNorm}(x + \mathrm{Sublayer}(x))
 $$
 
-（原始 Transformer 为 Post-Norm，现代更常用 Pre-Norm）
+这是原始 Transformer 的 Post-Norm；现代大模型更常用 `x + Sublayer(LayerNorm(x))` 的 Pre-Norm。
 
 - **Why 残差？**
   解决深层网络梯度消失问题，保证梯度能直接从损失流回浅层。
@@ -299,8 +264,8 @@ $$
   - 在 Transformer 中，LN 能使训练更稳定。
 
 - **Pre-Norm vs Post-Norm**：
-  - **Post-Norm**（原始）：$\mathrm{LN}(x + \mathrm{Sublayer}(x))$。收敛慢，需要 warmup，但理论表达能力强。
-  - **Pre-Norm**（主流）：$x + \mathrm{Sublayer}(\mathrm{LN}(x))$。梯度流更顺畅，无需 warmup，训练稳定，但可能略低于 Post-Norm 的理论上限。几乎所有大模型（GPT、LLaMA）都用 Pre-Norm。
+  - **Post-Norm**（原始）：`LN(x + Sublayer(x))`。收敛慢，需要 warmup，但理论表达能力强。
+  - **Pre-Norm**（主流）：`x + Sublayer(LN(x))`。梯度流更顺畅，无需 warmup，训练稳定，但可能略低于 Post-Norm 的理论上限。几乎所有大模型（GPT、LLaMA）都用 Pre-Norm。
 
 ##### ③ 最后的 Softmax
 
@@ -372,7 +337,7 @@ MoE 的一句话是：**总参数可以很大，但每个 Token 只激活少量 
 **原理**：每个 token 独立地选择最合适的 Top-K 个专家。Router 对每个 token 输出一个对所有专家的概率分布，然后每个 token 挑选概率最高的 K 个专家，将自身的表示发送给这些专家，专家的输出按路由概率加权求和。
 
 **公式**：
-对于 token $x$，Router 输出 logits $h(x) = W_g x$（$W_g \in \mathbb{R}^{E \times d}$），再经 softmax 得到路由概率 $p$。选择 Top-K 索引集合 $\mathcal{T}$ 后，令 $g_i$ 表示第 $i$ 个 Expert，最终输出：
+对于 token `x`，Router 输出 logits `h(x) = W_g x`（`W_g ∈ R^{E × d}`），再经 softmax 得到路由概率 `p`。选择 Top-K 索引集合 `T_set` 后，令 `g_i` 表示第 `i` 个 Expert，最终输出：
 
 $$
 y = \sum_{i \in \mathcal{T}} p_i g_i(x)
@@ -390,14 +355,7 @@ $$
 
 **原理**：每个专家选择它要处理的 token，而不是 token 选择专家。具体来说，对所有 token 的路由分数，每个专家挑选分数最高的 Top-K 个 token（或者按容量选择）。专家输出后，再根据路由分数加权聚合回每个 token。
 
-**公式**（简化）：
-设 batch 中有 $T$ 个 token，每个 token 有路由分数 $s_{t,i}$ 表示 token $t$ 与专家 $i$ 的匹配度。专家 $i$ 选择分数最高的 $C_i$ 个 token，其中可取 $C_i=\gamma T/E$，$\gamma$ 为容量因子。被选中的 token 集合记为 $\mathcal{T}_i$，专家输出记为 $y_{t,i}=g_i(x_t)$。最终 token $t$ 的输出为：
-
-$$
-y_t = \sum_{i: t \in \mathcal{T}_i} \frac{s_{t,i}}{\sum_{t' \in \mathcal{T}_i} s_{t',i}} \cdot y_{t,i}
-$$
-
-即用该 token 在专家 i 的选中集合中的归一化分数作为权重。
+设 batch 中有 `T` 个 Token，每个 Expert 固定选择得分最高的 `C=γT/E` 个 Token，处理后再按路由分数聚合回原 Token。这里的重点是：**容量从 Expert 视角预先固定，所以负载天然更均衡。**
 
 **特点**：
 
@@ -413,19 +371,13 @@ $$
 
 #### 4.2 路由选择
 
-Router的本质是一个线性层 $W_g \in \mathbb{R}^{E \times d}$，输入 token 的隐向量 $x \in \mathbb{R}^d$，输出 logits $z = W_g x$（维度 $E$，专家数量）。然后经过 softmax 得到概率分布。
+Router的本质是一个线性层 `W_g ∈ R^{E × d}`，输入 token 的隐向量 `x ∈ R^d`，输出 logits `z = W_g x`（维度 `E`，专家数量）。然后经过 softmax 得到概率分布。
 
 **关点**：
 
-- **噪声注入**（训练时）：Switch Transformer 等模型在路由 logits 中添加可调节的高斯噪声，鼓励探索，防止 Router 过早收敛到次优分配。公式：
+- **噪声注入**（训练时）：在 Router logits 上加入可调节噪声，避免训练早期总是命中少数 Expert；噪声通常随训练逐渐减弱。
 
-$$
-z_i = \frac{x \cdot W_g^{(i)} + \epsilon \cdot \mathrm{softplus}(x \cdot W_n^{(i)})}{\tau}
-$$
-
-其中 $\epsilon \sim \mathcal{N}(0,1)$，$W_n$ 是可学习的噪声参数，$\tau$ 是温度。训练初期噪声大，后期逐渐降低。
-
-- **温度系数**：可以引入温度 $T$ 来平滑或锐化分布。$T<1$ 使分布更尖锐（偏向最大专家），$T>1$ 更平滑。通常 $T=1$。
+- **温度系数**：可以引入温度 `T` 来平滑或锐化分布。`T<1` 使分布更尖锐（偏向最大专家），`T>1` 更平滑。通常 `T=1`。
 
 **常见问题**：
 
@@ -445,7 +397,7 @@ $$
 - **软 Top-K**：使用连续的近似，如对概率分布做 top-k 平滑（将非 Top-K 的概率置 0，再归一化），仍然可微但计算稍复杂。
 
 **容量因子（Capacity Factor）**：
-为了控制每个专家处理的 token 数量，常引入容量因子。若 batch 中有 $T$ 个 token，每个专家容量可写为 $C=\gamma T/E$。如果某个专家被分配的 token 超过容量，超出的 token 会被丢弃（或通过残差连接绕过专家）。容量因子 $\gamma$ 通常设为 1.0~1.5，避免 token 被丢弃过多。
+为了控制每个专家处理的 token 数量，常引入容量因子。若 batch 中有 `T` 个 token，每个专家容量可写为 `C=γ T/E`。如果某个专家被分配的 token 超过容量，超出的 token 会被丢弃（或通过残差连接绕过专家）。容量因子 `γ` 通常设为 1.0~1.5，避免 token 被丢弃过多。
 
 **常见问题**：
 
@@ -468,45 +420,18 @@ $$
 
 这是最常用的方法，在训练目标中加入一个辅助损失，惩罚负载不均衡。常见的两种形式：
 
-**a) Importance-based Loss（Switch Transformer）**
+**a) Importance-based Loss（Switch Transformer）**：同时观察 Expert 实际接收的 Token 占比，以及 Router 分给它的平均概率；某个 Expert 在两项指标上都过高，就增加惩罚。
 
-$$
-\mathcal{L}_{aux} = \alpha \sum_{i=1}^{E} f_i P_i
-$$
-
-其中：
-
-- $f_i = \frac{1}{T} \sum_{t=1}^{T} \mathbf{1}[r(t)=i]$，其中 $r(t)$ 为 token $t$ 被路由到的专家，即专家 $i$ 被选中的 token 比例。
-- $P_i = \frac{1}{T} \sum_{t=1}^{T} p_{t,i}$，即所有 token 对专家 $i$ 的平均路由概率。
-- $\alpha$ 是系数，通常取 0.01。
-
-**解释**：当专家 $i$ 被选中的频率 $f_i$ 高，同时 Router 给它的平均概率 $P_i$ 也高时，损失大。这鼓励 Router 使 $f_i$ 和 $P_i$ 都接近 $1/E$，即均匀分布。
-
-**b) Load-based Loss（GShard）**
-直接基于每个专家实际处理的 token 数量 $l_i$ 计算方差或与均值的差异：
-
-$$
-\mathcal{L}_{aux} = \alpha \sum_{i=1}^{E} \left( \frac{l_i}{T} - \frac{1}{E} \right)^2
-$$
-
-更直接地强制每个专家处理的 token 数量相等。
+**b) Load-based Loss（GShard）**：直接惩罚各 Expert 实际负载偏离平均值 `T/E` 的程度，更直观地约束负载均衡。
 
 **常见问题**：
 
-- 辅助损失如何与主损失（如语言建模损失）平衡？系数 $\alpha$ 如何选择？（通常很小，如 0.01，否则会干扰主任务）
+- 辅助损失如何与主损失（如语言建模损失）平衡？系数 `α` 如何选择？（通常很小，如 0.01，否则会干扰主任务）
 - 辅助损失是否会影响模型性能？（适当使用可提升性能，因为负载均衡本身也有利于充分利用专家容量）
 
 ##### 熵正则化（Entropy Regularization）
 
-**原理**：鼓励 Router 的输出概率分布更“均匀”（即高熵），避免分布过于集中在少数专家上。
-
-**公式**：
-
-$$
-\mathcal{L}_{ent} = -\alpha \frac{1}{T} \sum_{t=1}^{T} \sum_{i=1}^{E} p_{t,i} \log p_{t,i}
-$$
-
-最大化熵（最小化负熵）使分布平坦，从而每个 token 不会过分依赖单一专家，间接促进专家利用的多样性。
+**原理**：通过提高 Router 分布的熵，避免概率过早集中到少数 Expert，间接提升专家利用多样性。这里理解“分布越尖锐，熵越低”即可。
 
 **与辅助损失的区别**：
 
@@ -517,16 +442,16 @@ $$
 **常见问题**：
 
 - 熵正则化为什么能缓解路由坍塌？（防止 Router 输出尖锐分布，迫使每个 token 考虑多个专家）
-- 熵正则化会不会导致每个 token 选择的专家过于分散，降低模型能力？（通过调节 $\alpha$ 可以平衡）
+- 熵正则化会不会导致每个 token 选择的专家过于分散，降低模型能力？（通过调节 `α` 可以平衡）
 
 ##### 硬约束（Hard Constraints）
 
 不通过损失惩罚，而是直接对路由施加硬性限制，确保负载均衡。
 
 **a) Expert Capacity 限制**
-每个专家设置最大 token 容量（如 $C=\lceil \gamma T/E \rceil$）。当某个专家被分配的 token 达到容量后，后续选择该专家的 token 会被强制重定向到其他专家（或直接丢弃/绕过）。
+每个专家设置最大 token 容量（如 `C=ceil(γ T/E)`）。当某个专家被分配的 token 达到容量后，后续选择该专家的 token 会被强制重定向到其他专家（或直接丢弃/绕过）。
 
-**实现**：在训练时，记录每个专家已处理的 token 数量，当超过容量时，将该 token 的该专家分数设为 $-\infty$，使其不再被选中。
+**实现**：在训练时，记录每个专家已处理的 token 数量，当超过容量时，将该 token 的该专家分数设为 `-∞`，使其不再被选中。
 
 **b) 强制均匀采样（Stochastic Routing）**
 在训练初期，以一定概率随机分配专家（无视 Router 分数），强制每个专家都有机会训练。随着训练进行，逐渐退火到完全由 Router 决定。
@@ -565,7 +490,7 @@ Image → Patchify → Vision Encoder → Projector / Resampler
 
 #### 5.1 第一步：把图像切成 Patch
 
-ViT 把图像切成固定大小的 Patch，再把每个 Patch 展平并线性投影。若输入尺寸为 $H\times W$，Patch 尺寸为 $P\times P$，视觉 Token 数为：
+ViT 把图像切成固定大小的 Patch，再把每个 Patch 展平并线性投影。若输入尺寸为 `H× W`，Patch 尺寸为 `P× P`，视觉 Token 数为：
 
 $$
 N_{vision}=\frac{H}{P}\times\frac{W}{P}
@@ -597,21 +522,13 @@ Patch Embedding 只完成像素分块，还不包含高级语义。Vision Encode
 
 二维位置信息尤其重要：文字“猫在桌子下面”不仅依赖物体是什么，还依赖它们的相对位置。常见方案包括绝对位置 Embedding、二维 RoPE、相对位置 Bias。输入分辨率变化后，固定位置 Embedding 还需要插值；处理不当会导致高分辨率或非训练宽高比下能力下降。
 
-Vision Encoder 的输出通常为：
+Vision Encoder 的输出形状通常为 `[B, N_vision, D_v]`。
 
-$$
-F_v\in\mathbb{R}^{B\times N_{vision}\times D_v}
-$$
-
-它已经包含视觉语义，但维度 $D_v$、数值分布和 Token 数量通常都与 LLM 不匹配，因此不能简单地把它当作文本 Embedding 使用。
+它已经包含视觉语义，但维度 `D_v`、数值分布和 Token 数量通常都与 LLM 不匹配，因此不能简单地把它当作文本 Embedding 使用。
 
 #### 5.3 第三步：Projector 对齐视觉与语言空间
 
-Projector 将视觉特征从 $D_v$ 映射到 LLM hidden size $D_l$：
-
-$$
-F_l=Projector(F_v),\qquad F_l\in\mathbb{R}^{B\times N'\times D_l}
-$$
+Projector 将视觉特征从 `D_v` 映射到 LLM hidden size `D_l`，输出形状为 `[B, N', D_l]`；其中 `N'` 是否小于原视觉 Token 数取决于是否同时做了压缩或重采样。
 
 常见方案的区别是“保留多少视觉 Token”：
 
@@ -849,9 +766,9 @@ effective_batch_tokens
 PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到接近全量微调的效果，尤其适合 MoE 这种参数巨大的模型。
 
 **LoRA（Low-Rank Adaptation）**
-- **原理**：假设微调时的权重变化 $\Delta W$ 是低秩的，即 $\Delta W = BA$，其中 $B \in \mathbb{R}^{d_{\mathrm{out}} \times r}$，$A \in \mathbb{R}^{r \times d_{\mathrm{in}}}$，$r \ll \min(d_{\mathrm{in}}, d_{\mathrm{out}})$。原始前向传播变为 $h = W_0 x + BA x$，训练时只更新 $B$ 和 $A$，$W_0$ 冻结。
-- **优点**：推理时可将 $BA$ 合并到 $W_0$ 中，不增加额外延迟；参数量极少（通常 r=8~64），效果好，社区支持广泛。
-- **缺点**：需要选择合适的秩 $r$；如果模型本身已经过拟合，低秩假设可能限制表达能力。
+- **原理**：假设微调时的权重变化 `Δ W` 是低秩的，即 `Δ W = BA`，其中 `B ∈ R^{d_{out} × r}`，`A ∈ R^{r × d_{in}}`，`r ≪ min(d_{in}, d_{out})`。原始前向传播变为 `h = W_0 x + BA x`，训练时只更新 `B` 和 `A`，`W_0` 冻结。
+- **优点**：推理时可将 `BA` 合并到 `W_0` 中，不增加额外延迟；参数量极少（通常 r=8~64），效果好，社区支持广泛。
+- **缺点**：需要选择合适的秩 `r`；如果模型本身已经过拟合，低秩假设可能限制表达能力。
 
 **Adapter**
 - **原理**：在 Transformer 的每个子层（通常 FFN 后）插入一个小型 MLP，结构为“降维 → 激活 → 升维”，例如先将 768 维降为 64 维，再升回 768 维。只训练这些 Adapter 参数。
@@ -866,7 +783,7 @@ PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到
 
 **IA³（Infused Adapter by Inhibiting and Amplifying Inner Activations）**
 - **原理**：对注意力机制的 K、V 以及 FFN 的输入分别乘以可学习的缩放向量（即对特征维度做逐元素缩放），每个向量长度等于特征维度。
-- **优点**：参数量极少（三个向量，约 $3 \times d_{\mathrm{model}}$），效果在不少任务上接近 LoRA。
+- **优点**：参数量极少（三个向量，约 `3 × d_{model}`），效果在不少任务上接近 LoRA。
 - **缺点**：实现相对小众，社区支持不如 LoRA。
 
 **常见问题**
@@ -880,15 +797,15 @@ PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到
 
 ##### 1.4.1 注入位置与参数量
 
-对线性层 $W \in \mathbb{R}^{d_{out}\times d_{in}}$，LoRA 学习：
+对线性层 `W ∈ R^{d_{out}× d_{in}}`，LoRA 学习：
 
 $$
 y = W x + \frac{\alpha}{r} B A x
 $$
 
-其中 $A\in\mathbb{R}^{r\times d_{in}}$、$B\in\mathbb{R}^{d_{out}\times r}$。单层可训练参数为 $r(d_{in}+d_{out})$。常见 target modules 是 Attention 的 `q_proj/k_proj/v_proj/o_proj` 和 MLP 的 `gate_proj/up_proj/down_proj`。只选 Q/V 更省参数；同时选 Attention+MLP 通常容量更强。选择应通过消融实验，不要依赖固定配方。
+其中 `A∈R^{r× d_{in}}`、`B∈R^{d_{out}× r}`。单层可训练参数为 `r(d_{in}+d_{out})`。常见 target modules 是 Attention 的 `q_proj/k_proj/v_proj/o_proj` 和 MLP 的 `gate_proj/up_proj/down_proj`。只选 Q/V 更省参数；同时选 Attention+MLP 通常容量更强。选择应通过消融实验，不要依赖固定配方。
 
-常用初始化是 $A$ 随机、$B=0$，使训练开始时 LoRA 分支输出为 0，模型与基座模型完全一致。`lora_dropout` 仅应在数据小、过拟合明显时使用。
+常用初始化是 `A` 随机、`B=0`，使训练开始时 LoRA 分支输出为 0，模型与基座模型完全一致。`lora_dropout` 仅应在数据小、过拟合明显时使用。
 
 下面这个最小实现把公式中的两条路径直接对应到代码。`base` 冻结，反向传播只更新 `A/B`：
 
@@ -927,7 +844,7 @@ QLoRA 将冻结的基座权重以 4-bit 形式加载，计算时反量化到 BF1
 
 ##### 1.4.4 Merge、验证与部署
 
-合并操作为 $W' = W + \frac{\alpha}{r}BA$。建议在 FP32/BF16 中合并，再根据目标服务格式量化，避免在低精度权重上反复 merge/unmerge 导致误差累积。合并前后用固定输入比较 logits 或生成结果，并检查 tokenizer、generation config 和特殊 token 是否一起发布。
+合并操作为 `W' = W + (α)/(r)BA`。建议在 FP32/BF16 中合并，再根据目标服务格式量化，避免在低精度权重上反复 merge/unmerge 导致误差累积。合并前后用固定输入比较 logits 或生成结果，并检查 tokenizer、generation config 和特殊 token 是否一起发布。
 
 动态 Adapter Serving 能让多个任务共享基座权重，但需要解决 adapter 缓存、版本路由、租户隔离、batch 内 adapter 切换和冷加载延迟。合并部署的运行时更简单，但每个任务都需要独立权重副本。
 
@@ -967,11 +884,7 @@ $$
 +\alpha T^2 KL(p_t^T\parallel p_s^T)
 $$
 
-$$
-p^T=softmax(z/T)
-$$
-
-$T>1$ 将分布变平，暴露非目标类的相对概率；$T^2$ 用于补偿温度带来的梯度缩放。KL 方向应明确表示「用学生逼近教师」，实现时需核对库函数的 input/target 语义。
+其中软分布由 `p^T = softmax(z/T)` 得到。`T>1` 将分布变平，暴露非目标类的相对概率；`T²` 用于补偿温度带来的梯度缩放。KL 方向应明确表示「用学生逼近教师」，实现时需核对库函数的 input/target 语义。
 
 PyTorch 的 `kl_div(input, target)` 要求 `input` 是 log-probability，因此实现时教师与学生的位置不能写反：
 
@@ -1150,21 +1063,17 @@ RLHF 通常分三步走：**SFT**（使用监督数据微调）、**奖励模型
 #### 2.2 奖励模型训练
 
 **模型结构**
-奖励模型通常基于 SFT 模型（也可以使用更小的模型），将最后的语言建模头替换为一个 **标量输出头**（如线性层加 sigmoid），用于输出一个奖励值 $r(x,y)$，表示在 prompt $x$ 下回答 $y$ 的好坏。
+奖励模型通常基于 SFT 模型（也可以使用更小的模型），将最后的语言建模头替换为一个 **标量输出头**（如线性层加 sigmoid），用于输出一个奖励值 `r(x,y)`，表示在 prompt `x` 下回答 `y` 的好坏。
 
 **损失函数**
-使用 **pairwise ranking loss**（对比损失）：
+使用 **pairwise ranking loss**：`L = -log sigmoid(r_chosen-r_rejected)`。
 
-$$
-\mathcal{L} = -\log \sigma\left(r_\theta(x, y_{\mathrm{chosen}}) - r_\theta(x, y_{\mathrm{rejected}})\right)
-$$
-
-其中 $\sigma$ 是 sigmoid 函数。该损失鼓励模型给 chosen 的回答打更高的分，rejected 的回答打更低的分。
+其中 `σ` 是 sigmoid 函数。该损失鼓励模型给 chosen 的回答打更高的分，rejected 的回答打更低的分。
 
 **训练技巧**
 - **批处理**：由于每个 prompt 可能有多对 `(chosen, rejected)`，需要确保同一 prompt 下的所有对在同一个 batch 中，以便正负例来自相同上下文。
 - **正则化**：使用权重衰减、dropout 等防止过拟合。
-- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 $r(x, y_{\mathrm{chosen}}) > r(x, y_{\mathrm{rejected}})$ 的正确比例。此外，也可用人机对比评估。
+- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 `r(x, y_{chosen}) > r(x, y_{rejected})` 的正确比例。此外，也可用人机对比评估。
 
 **常见问题**
 - **为什么不用均方误差（MSE）预测绝对分数？** 因为绝对分数难以标注且主观性强，pairwise 更稳定。
@@ -1199,9 +1108,9 @@ PPO 是在线 RL 算法。它不只学习旧数据中 “A 胜过 B”，而是�
 例如模型解一道题，连续两次给出不同过程：第一次最终答案错、Reward 为 0；第二次过程严谨且答案对、Reward 为 1。PPO 不只是笼统地记住“第二篇更好”，而是把第二次生成过程中的每个 Token 都回看一遍：哪些选择更可能把答案带向高分，就提高其概率；哪些选择更可能导致低分，就降低其概率。Critic 的作用是估计“这道题平均大概能得多少分”，从而区分“真的很好”与“只是比预期稍好”。
 
 **核心流程**：
-1. **采样**：从当前策略 $\pi_\theta$ 中采样一批 prompt 并生成回答。
-2. **打分**：用奖励模型计算每个回答的奖励 $r(x,y)$。
-3. **优势估计**：将奖励换成“比预期好多少”的优势 $A_t$。通常由 Critic（价值模型）估计预期分数；$A_t>0$ 表示这一步值得鼓励，$A_t<0$ 表示应收敛。
+1. **采样**：从当前策略 `π_θ` 中采样一批 prompt 并生成回答。
+2. **打分**：用奖励模型计算每个回答的奖励 `r(x,y)`。
+3. **优势估计**：将奖励换成“比预期好多少”的优势 `A_t`。通常由 Critic（价值模型）估计预期分数；`A_t>0` 表示这一步值得鼓励，`A_t<0` 表示应收敛。
 4. **策略更新**：先计算新旧策略对同一动作的概率比：
 
 $$
@@ -1211,11 +1120,7 @@ $$
 如果优势 `A_t > 0`，说明该动作值得提高概率；如果 `A_t < 0`，则应降低概率。PPO 不允许概率比 `r_t(θ)` 在一次更新中偏离 1 太远，因此使用裁剪后的策略目标：
 
 $$
-c_\epsilon(r)=\min\bigl(\max(r,1-\epsilon),1+\epsilon\bigr)
-$$
-
-$$
-L_{PPO}=\mathbb{E}_t\left[\min\bigl(r_tA_t,\ c_\epsilon(r_t)A_t\bigr)\right]
+L_{PPO}=\mathbb{E}_t\left[\min\bigl(r_tA_t,\ \mathrm{clip}(r_t,1-\epsilon,1+\epsilon)A_t\bigr)\right]
 $$
 
 `clip` 将有效更新限制在旧策略附近，避免少量高优势样本让策略一步走得过远。实际训练还要同时考虑三部分：
@@ -1245,13 +1150,13 @@ DPO 将 RLHF 转成一个直接的偏好学习问题，不训练 Reward Model，
 
 继续用 A、B 两个回答举例：训练时模型不必重新写一遍答案，也没有人在线给它打分；它只需要比较“在相同 prompt 下，我给 A 的概率是否已经比参考模型更高，同时给 B 的概率是否更低”。所以 DPO 本质上是**从已有偏好对中做一次有方向的概率对比**，不是让模型在环境中试错。
 
-**核心思想**：从偏好数据中推导出一个隐式奖励函数，并通过最大似然直接优化策略。损失函数为：
+**核心思想**：比较两项相对参考模型的变化：`chosen 相对增益 - rejected 相对增益`。完整目标为：
 
 $$
 \mathcal{L}_{DPO}(\pi_\theta; \pi_{ref}) = -\mathbb{E}_{(x,y_w,y_l) \sim \mathcal{D}} \left[ \log \sigma\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]
 $$
 
-其中 $\beta$ 是控制 KL 惩罚强度的超参数，$\pi_{\mathrm{ref}}$ 是固定的参考策略（通常为 SFT 模型）。
+训练让这个差值为正且逐渐增大；外层用 log-sigmoid 转成损失。`β` 控制偏好更新强度，`π_ref` 通常是固定的 SFT 模型。
 
 **优点**：
 - 只需维护两个模型（策略和参考），无需 critic 和奖励模型，显存减半。
@@ -1267,7 +1172,7 @@ $$
 
 ##### GRPO（Group Relative Policy Optimization）
 
-GRPO 是 PPO 的轻量变体。对同一个问题一次采样 $G$ 个回答，例如 8 个解题过程；如果其中 6 个错、2 个对，就让正确回答相对增加概率。它不问“这题理论上该得几分”，只问“这一组里谁更好”，因此可以不用 Critic。
+GRPO 是 PPO 的轻量变体。对同一个问题一次采样 `G` 个回答，例如 8 个解题过程；如果其中 6 个错、2 个对，就让正确回答相对增加概率。它不问“这题理论上该得几分”，只问“这一组里谁更好”，因此可以不用 Critic。
 
 这特别适合有**可验证奖励**的任务：数学答案是否正确、代码能否通过测试、格式是否满足约束。奖励不必被标得非常精确，只要能把同一组候选大致排出高低即可。
 
@@ -1285,18 +1190,20 @@ $$
 A_i=\frac{r_i-\bar r}{s_r+\delta}
 $$
 
-其中 $G$ 为每组采样回答数。
+其中 `G` 为每组采样回答数。
 
-**策略损失**（带 clip）：
+得到组内优势后，策略更新继续复用 PPO 风格的概率比与 clip：
 
 $$
 \mathcal{L}_{GRPO} = -\frac{1}{G}\sum_{i=1}^G \min\left( \frac{\pi_\theta(o_i|x)}{\pi_{ref}(o_i|x)} A_i,\ c_\epsilon\left(\frac{\pi_\theta(o_i|x)}{\pi_{ref}(o_i|x)}\right) A_i \right)
 $$
 
+因此 `A_i>0` 的回答概率会提高，`A_i<0` 的回答概率会降低，同时 clip 限制单次更新幅度。
+
 
 **核心创新**：
 - 对每个 prompt，采样一组回答（group），用组内的平均奖励作为基线（baseline），代替 critic 网络的价值估计。
-- 优势函数用组均值 $\bar r$ 作基线：高于均值的回答 $A_i>0$，低于均值的回答 $A_i<0$。
+- 优势函数用组均值 `mean(r)` 作基线：高于均值的回答 `A_i>0`，低于均值的回答 `A_i<0`。
 - 策略更新仍使用 PPO 的 clip 目标，但无需单独的价值网络，从而节省显存。
 
 **优点**：显存占用低于 PPO（少一个 critic 模型），且通过组内相对比较缓解了奖励尺度不一致的问题。
@@ -1374,7 +1281,7 @@ ZeRO 允许在数据并行的框架下训练比单卡显存大得多的模型，
 | 精度 | 较高 | 较低 |
 
 **损失缩放（FP16 必需）**：
-反向传播前将 loss 乘以 $S$（如 128），梯度更新后除以 $S$。
+反向传播前将 loss 乘以 `S`（如 128），梯度更新后除以 `S`。
 
 **代码（PyTorch）**：
 ```python
@@ -1468,7 +1375,7 @@ $$
 M_{KV}=2LBN_{KV}SDb
 $$
 
-其中，$L$ 为层数，$B$ 为并发序列数，$N_{KV}$ 为 KV Head 数，$S$ 为序列长度，$D$ 为 Head Dim，$b$ 为每个元素的字节数。
+其中，`L` 为层数，`B` 为并发序列数，`N_{KV}` 为 KV Head 数，`S` 为序列长度，`D` 为 Head Dim，`b` 为每个元素的字节数。
 
 系数 2 对应 Key 和 Value。使用 GQA/MQA 时应代入 `num_kv_heads`，而不是 Query Head 数。
 
@@ -1515,7 +1422,7 @@ Q、K 从 HBM 读入
 → 再与 V 相乘
 ```
 
-GPU 的矩阵乘法很快，但 HBM 和计算单元之间来回搬运这个 $S\times S$ 中间矩阵很贵。可以把 HBM 理解为仓库，片上 SRAM 理解为工位：普通 Attention 反复把整批半成品送回仓库；FlashAttention 则把 Q、K、V 分成能放进工位的小块，在 SRAM 中完成“打分 → Softmax → 聚合 V”，最后只把输出写回 HBM。
+GPU 的矩阵乘法很快，但 HBM 和计算单元之间来回搬运这个 `S× S` 中间矩阵很贵。可以把 HBM 理解为仓库，片上 SRAM 理解为工位：普通 Attention 反复把整批半成品送回仓库；FlashAttention 则把 Q、K、V 分成能放进工位的小块，在 SRAM 中完成“打分 → Softmax → 聚合 V”，最后只把输出写回 HBM。
 
 ```text
 普通 Attention：算一段 → 写巨大中间矩阵 → 再读回来 → 继续算
@@ -1542,7 +1449,7 @@ FlashAttention：读一个小块 → 在 SRAM 内算完 → 只写最终结果
 | E2E Latency | 整个回答何时完成 | TTFT + 输出长度 × TPOT |
 | Throughput | 集群每秒完成多少请求/Token | Batch、调度、GPU 利用率 |
 
-例如一个请求 TTFT 为 1 s，之后生成 200 Token，TPOT 为 30 ms，那么用户大约在 1 s 后看到首字，完整等待时间约为 $1 + 200 \times 0.03 = 7$ s。优化 TTFT 与优化 TPOT 解决的是两种不同的体感问题。
+例如一个请求 TTFT 为 1 s，之后生成 200 Token，TPOT 为 30 ms，那么用户大约在 1 s 后看到首字，完整等待时间约为 `1 + 200 × 0.03 = 7` s。优化 TTFT 与优化 TPOT 解决的是两种不同的体感问题。
 
 #### 4.3.1 Prefill 与 Decode
 
