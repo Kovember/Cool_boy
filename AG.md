@@ -5,20 +5,11 @@ date: "2026 年 7 月"
 lang: zh-CN
 ---
 
-大模型本身只负责根据输入生成下一段文本或结构化动作。真正让模型能够持续完成复杂任务的是围绕模型建立的一套确定性工程系统：它负责构建上下文、驱动 ReAct Loop、持久化状态、恢复中断、限制权限、调度子任务等。这套系统就是 **Agent Harness**。
+大模型本身只负责根据输入生成下一段文本或结构化动作。真正让模型能够持续完成复杂任务的是围绕模型建立的一套确定性工程系统：它负责构建上下文、驱动 ReAct Loop、持久化状态、纠偏容错、限制权限、调度子Agent等。这套系统就是 **Agent Harness**。
 
 本文的核心结论是：
 
-> **Agent Harness 是围绕 Model–Tool 为原子能力的 ReAct Loop 构建的 Run、Context、Control、State、Security 和 Orchestration 系统。**
-
-| 容易混淆的概念 | 更准确的边界 |
-|---|---|
-| ReAct Loop、Thread State 与 Agent Runtime | ReAct Loop 驱动 Agent 自主循环；Thread State 记录可恢复事实；Runtime 管当前进程的执行状态 |
-| Runtime 与 Harness | Runtime 管当前怎么运行；Harness 管上下文、持久化、安全与治理 |
-| Context 与 Thread State | Context 是本轮模型输入快照；Thread State 是持久化的状态数据 |
-| Function Calling 与 MCP | Function Calling 是 Model↔Harness 动作协议；MCP 是 Harness↔Tool Server 协议 |
-| Workspace 与 Sandbox | Workspace 描述执行环境；Sandbox 强制限制环境边界 |
-
+> **Agent Harness 是围绕 Model‑Tool 为原子能力的 ReAct Loop 构建的，具备健壮可靠、纠偏兜底、成本友好的生产级 Agent 系统工程框架**。
 ---
 
 # 一、Agent 架构的演进
@@ -57,25 +48,17 @@ User Message
 Conversation History
 Retrieved Documents
 Tool Call / Tool Result
-Workspace State
-Memory
-Goal / Plan
 Active Skill
+Workspace / Memory
+Goal / Plan
 Subagent Result
 ```
 
-对于仓库修复任务，我们可以检索与报错函数相关的文件，并把片段放入 Prompt：
+这些来源并不意味着要被全量塞入 Context。**Context 是模型这一次能看到的输入投影，不是系统全部事实的副本。**
 
-```python
-context = retrieve(
-    query="test_parse_timestamp failed timezone",
-    sources=repository_index,
-)
+完整的运行事实应留在外部：状态数据库保存 Tool / Task 生命周期，文件系统与 Artifact Store 保存原文件和大结果，Memory / RAG 按相关性召回，Subagent 在隔离 Context 内完成局部探索后只返回结论与证据引用。
 
-prompt = system_prompt + user_task + context
-```
-
-模型现在“知道得更多”，但仍然不能可靠地执行动作。它不能自行读取新文件、运行测试或安全地修改代码；当上下文过长时，还会出现注意力稀释与信息冲突。
+模型缺什么，再通过 Tool 或 Reference 按需展开；这样既不把有限窗口耗在低价值原文上，也让压缩后仍可以追溯和恢复。
 
 > **Context Engineering 主要解决：这一次模型调用应该看到什么。**
 
@@ -104,7 +87,7 @@ Harness Engineering 进一步处理模型调用之外的问题：
 
 可以用一句话概括发展过程：
 
-> **Prompt 决定模型如何理解，模型输入上下文 决定模型这一轮真正看到什么，Harness 决定模型如何在外部世界持续、安全、可恢复地行动。**
+> **Prompt 决定模型如何理解，模型输入上下文 决定模型这一轮真正看到什么，Harness 决定模型如何在外部世界持续、高效、健壮地行动。**
 
 ---
 
@@ -118,28 +101,16 @@ Agent Harness 是包围模型循环的工程控制系统。它不负责替代模
 
 ```text
 Agent Runtime
-Tool-use
 Context
-State Store
+Tool Pipeline
+State Management
 Workspace & Sandbox
 Task Orchestration
 ```
 
 ![Agent Harness 总体架构](figures/agent-harness-architecture.png)
 
-最基本的架构原则是：
-
-```text
-Agent Harness
-  ├─ Agent Runtime / ReAct Loop
-  ├─ Context、State、Checkpoint
-  ├─ Tool、Sandbox、RAG
-  └─ Observability、Error Recovery
-
-Agent Runtime / ReAct Loop：Model Call ⇄ Tool Call / Tool Result
-```
-
-也就是说，Runtime 就是循环的驱动器；Harness 则是除模型推理能力之外，支撑并约束整个循环的工程系统。不要让 Runtime 直接耦合每一种 Harness 机制：
+Runtime 就是循环的驱动器；Harness 则是除模型推理能力之外，支撑并约束整个循环的工程系统。不要让 Runtime 直接耦合每一种 Harness 机制：
 
 ```python
 # 不推荐：让 Loop 知道每一种 Harness 机制
@@ -154,15 +125,15 @@ if needs_subagent:
 这种写法会让 Loop 逐渐变成不可测试、不可替换的“超级控制器”。更好的设计是：
 
 - Loop 只识别统一的 Tool Call 和 Tool Result；
-- Plan、Memory、Goal 通过普通 Tool 读写 Store；
+- Plan、Memory、Goal 通过普通 Tool 读写 DB Store；
 - Checkpoint 由 Runtime/Harness 在稳定边界触发；
-- Subagent 由 Scheduler 调度，但对模型可以表现为一个 Tool；
+- Subagent 由 Scheduler 异步调度，但对模型可以表现为一个 Tool；
 - 权限、审计、重试通过 Tool Executor 与 Hook 实现。
 
 一次 Agent Turn 可以概括为三个过程：
 
 ```text
-Environment（Thread State + Tool Results）+ Memory / RAG
+Environment（Prompt + State + Tool Results）+ Memory / RAG
     → Context Builder → 模型输入上下文
     读取、选择、压缩并冻结
 
@@ -173,10 +144,10 @@ Tool_calls
 Tool Result / Observation
     → Normalize → Tool Call State + Event Log + Artifact Ref
     → 追加为 Tool Message，供下一轮 Context Builder 读取
-    记录事实、结果与外部副作用引用
+    记录事实、结果与外部引用
 ```
 
-这里要区分**执行副作用**与**返回结果**：`tool.execute` 执行时才可能写入外部系统、Thread State 或 User Memory Store；Tool Result 本身只是这次执行的 Observation。Harness 将其规范化、持久化并回填 Context。模型若要更新 Goal / Plan 或写入长期记忆，仍需在下一轮显式调用对应的 `update_*` / `memory_write` Tool，而不是由任意 Tool Result 隐式改写状态。
+这里要区分**执行产物**与**返回结果**：`tool.execute` 执行时才可能写入外部系统、Thread State 或 User Memory Store；Tool Result 本身只是这次执行的 Observation。Harness 将其规范化、持久化并回填 Context。
 
 这就是 Harness 的核心闭环：**持久状态与外部信息被投影给模型，模型输出结构化 Tool Call，Harness 再把该调用安全地映射到真实 Tool 实现。**
 
@@ -544,7 +515,7 @@ Context → Model → Tool Call
 
 #### 短任务：Async I/O 足够
 
-Web API、RPC、数据库查询等任务通常在一个连接生命周期内结束。Harness 调用 `await tool.execute()` 后，协程会让出执行权，由 Event Loop 继续调度其他 Thread；底层 I/O Ready 或 Future 完成时，再将原协程放回 Ready Queue。这里“挂起”的是协程，不是阻塞 OS Thread，因此一个 Runtime 可以同时承载大量等待中的 Tool Call。
+Web API、RPC、数据库查询等任务通常在一个连接生命周期内结束。Harness 调用 `await tool.execute()` 后，协程会让出执行权挂起；底层 I/O Ready 或 Future 完成时，再将原协程放回 Ready Queue。因此一个 Runtime 可以同时承载大量等待中的 Tool Call。
 
 ```python
 async def run_short_tool(call):
@@ -564,7 +535,8 @@ async def run_short_tool(call):
 
 #### 长任务：MQ 完全解耦
 
-Browser、Sandbox、Deep Research 或大文件处理可能运行数分钟甚至更久。如果 Harness 一直维持 HTTP / RPC 连接，容易受到连接超时、实例重启和扩缩容迁移影响。更稳妥的方式是先持久化 Task，再投递 Command；Worker 独立消费和执行，完成后写回状态并投递 Result Event。Harness 可以释放当前请求资源，之后由完成事件重新调度对应 Thread。
+Browser、Sandbox、Deep Research 或大文件处理可能运行数分钟甚至更久。如果 Harness 一直维持 HTTP / TCP 连接，容易受到连接超时、实例重启和扩缩容迁移影响。
+更稳妥的方式是先持久化 Task，再投递 Command；Worker 独立消费和执行，完成后写回状态并投递 Result Event。Harness 可以释放当前请求资源，之后由完成事件重新调度对应 Thread。
 
 ```text
 Harness：Task=PENDING → Command Queue
@@ -580,7 +552,7 @@ MQ 在这里不仅负责通知，还提供生产者与 Worker 的完全解耦、
 
 #### 心跳：只负责异常兜底
 
-无论走哪条路径，Tool / Task 都应记录 `PENDING → RUNNING → SUCCEEDED / FAILED / CANCELLED / TIMEOUT`，长任务 Worker 还要定期更新 `last_heartbeat`。后台心跳任务周期检查：
+无论走哪条路径，Tool / Task 都应记录 `PENDING → RUNNING → SUCCEEDED / FAILED / CANCELLED / TIMEOUT`，长任务 Worker 还要定期更新 `last_heartbeat`。后台定时任务周期检查：
 
 ```text
 now > deadline                   → TIMEOUT
@@ -609,31 +581,28 @@ Resume / 故障恢复
 → Context Builder 按保存的 Context Snapshot 重建模型输入
 → Agent Loop 从上次中断处继续
 ```
+#### Checkpoint 的本质：Runtime State + Context
 
-#### Checkpoint 的本质：State + Context Snapshot
-
-Checkpoint 不是只存聊天历史；它是在稳定边界把 Runtime State 与当时的 Context Snapshot 一起持久化：
+Checkpoint 并非仅存储聊天历史，而是在执行稳定边界，将**Runtime State**与对应时**Context Snapshot**联合持久化。
 
 ```text
 Model / Tool / Subagent
         ↓
-Event Log / Artifact Store（追加式事实历史）
-        ↓ State Reducer
+State Reducer
 Harness Runtime State
 ├─ Tool / Task 状态、Tool Results
 ├─ Artifact / Evidence 引用、外部 task_id / idempotency_key
-└─ Goal / Plan、step、retry、budget、event cursor
+└─ Goal / Plan、step、retry、budget
         ↓ 稳定边界持久化
 Checkpoint Store
 ├─ Runtime State Snapshot
 └─ Context Snapshot
 ```
 
-Context 可以压缩，因为它只是模型当前视图；原始 Message、Tool Result 与证据仍留在 Event Log / Artifact Store。Summary 记录覆盖的 Event Range 与 Artifact 引用，模型或人工需要回看细节时可按需展开。
+Context Snapshot 支持压缩，它仅代表模型的当前视图；原始消息、工具返回与证据实体独立保存在外部存储。摘要记录对应制品引用，模型或人工需要回看完整细节时，可依据引用按需展开还原。
 
-恢复时加载 Snapshot：已完成的 Tool 复用结果；`RUNNING` / 状态未知的调用用 `tool_call_id`、幂等键或外部 `task_id` 核验，不能盲目重投。也就是：**恢复 State，重建 Context，核验在途操作，再从最后一个确定边界继续 Loop。**
-
-Agent 的“自驱”即：**事件到达时继续，取消到达时停止，恢复请求到达时从持久状态继续。**
+会话恢复时直接加载快照：已完成的工具调用直接复用结果；处于 `RUNNING` 或状态不明的调用，通过 `tool_call_id`、幂等键、外部 `task_id` 做状态核验，禁止盲目重复发起调用。
+即：**恢复 State，重建 Context，核验在途操作，从最后一个确定边界继续推进 Loop。**
 
 ## 2.4 可观测性：Event、Trace、Metric 与 Replay
 
@@ -658,21 +627,15 @@ thread_id → run_id → turn_id → span_id
 
 事件日志应支持离线 Replay：固定历史 Tool Result，只替换模型、Prompt 或 Context Policy，用于重现问题和回归评测。生产日志必须脱敏，原文可以只存入受控 Artifact Store，Trace 中仅保留哈希、摘要和引用。
 
-**常见问题**
-
-1. **Trace 和 Event Log 有什么区别？**
-   Trace 用于查看调用链和性能，可以采样；Event Log 用于状态恢复和审计，需要持久、有序、可重放。
-2. **为什么只看 Token 和延迟不够？**
-   它们只表示资源效率，还必须观察任务成功率、工具调用正确率、重复调用率和人工接管率。
-
 
 # 三、Tool-use：Function Calling、MCP 与 Skill
 
-Tool-call 是模型作用于外部世界的统一通道。无论底层是 Python 函数、Shell、浏览器、MCP Server，还是 Thread 内的 Goal / Plan 状态工具，Memory 召回和写入，对 ReAct Loop 都应表现为统一的 Tool Call / Tool Response 协议。
+Tool-use 是模型作用于外部世界的统一通道。无论底层是 Python 函数、CLI、浏览器、MCP Server，还是访问 DB 的 Goal / Plan 状态工具，Memory 召回和写入，对 ReAct Loop 都应表现为统一的 Tool Call / Tool Response 协议。
 
 ![Tool-use 生态：Function Calling、Skill 与 MCP](figures/tool-use-ecosystem.png)
 
-这里要区分三个层次：**Function Calling 是模型表达动作的协议，Harness 是解释并执行动作的运行时，Skill 是由 Harness 按需读取并回填给模型的能力说明**。Skill 不是绕过 Function Calling 独立注入模型；通常先由模型发起读取 Skill 的 Function Call，获得逐步披露的指令与资源，再据此发起后续 Function Call。这样既避免一次加载全部 Skill 占满上下文，也让每一次读取和执行都经过同一套权限、审计与异常处理。
+这里要区分三个层次：**Function Calling 是模型表达动作的协议，Harness 是解释并执行动作的运行时，Skill 是由 Harness 按需读取并回填给模型的能力说明**。
+Skill 不是绕过 Function Calling 独立注入模型；通常先由模型发起 `load_skill(skill_name)` 的 Function Call，获得逐步披露的指令与资源，再据此发起后续 Function Call。这样既避免一次加载全部 Skill 占满上下文，也让每一次读取和执行都经过同一套权限、审计与异常处理。
 
 ## 3.1 Tool 的本质
 
@@ -703,36 +666,82 @@ Harness 从 Tool Registry 读取名称、描述和 JSON Schema，并按 OpenAI `
 
 在不同 Provider API 中，Tool definitions 可能位于单独的 `tools` 字段，而不是普通消息文本中；但从模型的有效 Context 看，它们共同定义了“有哪些动作可用、参数应该长什么样”。
 
-### Tool 太多时：用 `tool_search` 渐进召回
+### Tool 太多时：Tool Search 让能力按需进入 Context
 
-Tool 并非越全量注入越好。数百个 Tool 的名称、描述和 JSON Schema 会挤占 Context、增加首 Token 延迟，也会让模型在相似工具间选错。此时保留少量高频核心 Tool，并把 `tool_search` 作为一个始终可见的元工具：模型先描述“需要什么能力”，Harness 再从 Registry 召回少量候选。
+全量 Function Calling 会把所有 Tool Schema 放进一次请求。几十个 Tool 就可能消耗上万 Token；更重要的是，模型要在大量相似能力中直接做选择，注意力容易稀释，或为低频的 Tool 背负长期 Context 成本。
+Tool Search 是 Tool 层的 **Lazy Loading**：先只暴露“有什么能力”，真正需要时再加载完整 Schema。
+
+| 类型 | 初始 Context 是否加载完整 Schema | 典型例子 |
+|---|---|---|
+| Eager Tool | 是 | `read_file`、`grep`、`bash`、`web_search`、`tool_search` 等高频基础能力 |
+| Deferred Tool | 否，只保留在 Tool Registry | GitHub Issue、Slack、Sentry、Notion、低频 MCP Tool |
 
 ```text
-初始 Context：核心 Tool + tool_search
-        ↓
-Model → tool_search(query, capability, constraints)
-        ↓
-Harness：检索 Tool Catalog + ACL / 环境 / 风险过滤
-        ↓
-Tool Result：候选名称、用途、限制、简短参数摘要
-        ↓
-Context Builder：将选中 Tool 的完整 JSON Schema 加入下一轮 tools 字段
-        ↓
-Model → 已加载 Tool 的普通 Function Call
+Tool Registry
+├── Eager Tools    → 初始 tools 字段：可立即调用
+└── Deferred Tools → 只保留 Metadata：等 Tool Search 命中后再 Materialize
 ```
 
-例如模型初始只看得到：
+#### 1. `tool_search`：根据意图检索 Tool Metadata
+
+模型发现当前任务缺少能力时，先调用始终可见的 `tool_search`，而不是猜测某个 Deferred Tool 的精确名字：
 
 ```json
 {
   "name": "tool_search",
-  "arguments": "{\"query\":\"查询本地代码仓库中的文件内容\",\"top_k\":3}"
+  "arguments": "{\"query\":\"list recent open issues in a GitHub repository\",\"top_k\":3}"
 }
 ```
 
-Harness 可以用名称、说明、标签、输入输出类型做关键词 / Embedding 混合检索，并先按用户权限、当前 Workspace、运行环境和风险等级过滤。返回 `read_file`、`search_code` 等候选后，**不能只把工具名写进 Tool Result 就允许调用**：Harness 必须在下一轮 Model Call 的 OpenAI `tools` 字段中注册被选中的完整 Schema，模型才真正获得可调用能力。
+它与 RAG 的结构相同，只是检索对象从 Document 变成 Tool：
 
-`tool_search` 只负责能力发现，不是权限边界，也不直接执行被召回的 Tool。候选数量应有限（如 Top-3～5），Active Tool Set 可随任务切换；高风险 Tool 即使被检索到，仍要经过后续的 Policy 与 Approval。
+```text
+任务意图 → Tool Retrieval → 候选 Tool → 加载 Schema → 正常 Tool Call
+```
+
+Catalog 的检索字段通常包括 `name`、`description`、标签、输入参数名与参数说明、输入/输出类型及所属 MCP Server。检索方式与 RAG 类似使用 BM25 或 Embedding 语义召回。无论哪种检索，都应**先过滤、再排序**：租户 ACL、用户权限、当前 Workspace、MCP 连通性、环境约束和风险等级不满足的 Tool 根本不进入候选集。
+
+`tool_search` 的结果应是 Top-3～5 个轻量 `tool_reference`，而不是把命中的完整 Schema 全塞回 Context：
+
+```json
+{
+  "tool_name": "github.list_issues",
+  "summary": "List open issues in a repository",
+  "input_hint": ["owner", "repo", "state"],
+  "risk": "read_only",
+  "reference": "toolref://github.list_issues"
+}
+```
+
+这一步把模型的选择空间从“数百选一”缩小到“少量候选中决策”；它不仅省 Token，也提高 Tool Selection Accuracy。
+
+#### 2. `tool_reference`：Deferred Tool 的引用，不是一次普通调用
+
+`tool_reference` 是嵌在 `tool_search` 的 `tool_result` 内容中的引用块，指向某个 `defer` 的 Tool Definition；下一轮 Model call 根据该引用把完整 Schema 展开到模型上下文。
+
+```text
+tool_search  = 找到哪些能力
+tool_reference = 指向并加载某个 Deferred Tool Definition
+tool_use / function_call = 真正执行已加载的 Tool
+```
+
+```text
+Model → tool_search("github open issue")
+      ↓
+Tool Result → tool_reference("github.list_issues")
+      ↓
+Harness → 找到 tool_reference 完整 JSON Schema
+      ↓
+下一轮 github.list_issues 加入上下文
+      ↓
+Model → 正常 Function Call → Tool Executor
+```
+
+因此，`tool_reference` 最适合作为“加载句柄 / 延迟定义”的概念，而不是设计成 `tool_reference(...)` 这样的业务动作工具。若还要读取用法示例、安全要求或关联 Skill/MCP Resource，应另设只读的 `tool_docs` / `tool_help` 能力；它不执行外部副作用，也不能代替权限校验。
+
+#### 3. tool_search 动态加载不应破坏 Prefix Cache
+
+稳定前缀只放 System、核心 Tool、`tool_search` 和固定 Skill Catalog；Deferred Tool 不回写进这段固定前缀。动态加载的结果应该追加到最近的工具调用结果中，而固定部分仍可复用 Cache。**不为了新增一个低频 Tool 而重建全部稳定上下文。**
 
 ### 第二层：模型返回 function_call JSON
 
@@ -807,133 +816,7 @@ class ToolRegistry:
 
 这里的 `ToolContext` 由 Harness 注入，通常包含 `thread_id`、Workspace、权限、AbortSignal 和 Event Writer。模型不应该自己提供这些可信字段。
 
-## 3.3 Tool Executor：执行前后的治理链
-
-生产级执行不能只是：
-
-```python
-return await tool.execute(args)
-```
-
-更完整的执行链是：
-
-```text
-Resolve
-→ Validate
-→ Policy Check
-→ Approval
-→ Admission Guard（Quota / Concurrency / Budget / Duplicate）
-→ Ledger Started
-→ Execute（Deadline + Cancellation）
-→ Normalize + Result Validate
-→ Ledger Completed
-→ Audit
-→ Tool Result
-```
-
-```python
-class ToolExecutor:
-    def __init__(self, registry, policy, approval, ledger):
-        self.registry = registry
-        self.policy = policy
-        self.approval = approval
-        self.ledger = ledger
-
-    async def execute(self, call, context):
-        try:
-            tool = self.registry.get(call.name)
-            args = validate(tool.input_schema, call.arguments)
-
-            decision = self.policy.check(tool, args, context)
-            if decision.requires_approval:
-                allowed = await self.approval.request(call, decision.reason)
-                if not allowed:
-                    return error_result(call.id, "rejected by user")
-
-            self.admission.check(call, context)  # 配额、并发、预算、重复调用
-            self.ledger.started(call)
-            raw = await run_with_deadline(
-                tool.execute(args, context), context.deadline, context.abort_signal
-            )
-            result = normalize(raw)
-            validate_result(tool.output_schema, result)
-            self.ledger.completed(call, result)
-            return tool_result(call.id, result)
-
-        except Exception as exc:
-            self.ledger.failed(call, str(exc))
-            return error_result(call.id, str(exc))
-```
-
-### 生产级 Tool 调用兜底
-
-生产级兜底的关键是：**模型只提出调用意图；是否重试、能等多久、何时停止，均由 Tool Registry 的策略和 Harness 决定。**模型最多收到结构化结果，再据此重新规划，不能自行无限重试。
-
-#### 1. 哪些 Tool 可以重试？由谁决定超时和次数？
-
-每个 Tool 在注册时都要声明副作用和执行策略；Tool Owner 根据下游 SLA、业务风险和是否支持幂等来配置默认值，Harness / Tool Executor 在运行时统一执行。模型不决定 timeout 或 retry 次数，也不能通过参数绕过策略。
-
-```python
-ToolPolicy(
-    readonly=True,
-    idempotency="none",          # none / required / supported
-    timeout_seconds=10,
-    max_retries=2,
-    retryable_errors={429, 502, 503, 504, "network_timeout"},
-)
-```
-
-可以按下面三类回答：
-
-| Tool 类型 | 例子 | 超时后默认动作 |
-|---|---|---|
-| 只读、天然幂等 | `search`、`read_file`、`get_order_status` | 对网络抖动、限流、部分 5xx 做有限重试 |
-| 有副作用，但支持幂等键 | `create_order(request_id)`、`send_message(idempotency_key)` | 先按 key / operation ID 查状态；确认未执行或服务端保证去重后才重试 |
-| 有副作用且无法确认幂等 | `charge_card`、不可逆删除、部分外部写接口 | 不自动重试；返回“执行状态未知”或请求用户确认 |
-
-重试还要区分**错误是否短暂**。`429`、网络断连、`502/503/504` 常是临时故障，可按指数退避加抖动重试；Schema 错误、无权限、业务规则拒绝等是确定性错误，重试没有价值，应直接把精简错误返回模型修正。`404` 通常不可重试，但最终一致性场景可由该 Tool 明确标记为短暂错误。
-
-Timeout 也不是模型说了算。Registry 定义单次调用的默认上限，Runtime 再给整个 Turn / Task 设置总 Deadline；一次调用的重试只能使用剩余时间。比如 `web_search` 单次 5 秒、最多 2 次，但本轮只剩 6 秒时，Harness 不会再完整执行两轮 5 秒请求。用户 Stop 或父 Task 取消时，Harness 向 Tool、子进程和 Subagent 传播取消信号；外部请求取消可能只是 best-effort，最终仍以 Tool Ledger 或外部 `operation_id` 查询结果为准。
-
-```text
-write_tool 超时
-→ 有 idempotency_key？
-   ├─ 有：query_status(key) → 已成功则复用；未执行才重试
-   └─ 无：标记 UNKNOWN_SIDE_EFFECT，不盲目重放
-```
-
-重试应由最了解下游幂等语义的 Tool Executor 统一负责，消耗同一份 retry budget。不能让 SDK、MCP Client、Executor 和 Agent Loop 都各重试几次，否则一次故障会被倍数放大。
-
-#### 2. 模型一直 Loop 调用 Tool 怎么办？
-
-`max_steps` 是最后保险，但不足以阻止资源浪费：模型可能在一个 Step 内并发很多 Tool，也可能反复 `search(A)`，或在 `read(A) → read(B) → read(A)` 之间循环。Harness 因此在每个 Run 维护调用窗口和预算，而不是等模型自己意识到出错。
-
-```text
-每次 Tool Call
-→ 记录 tool_name + arguments_hash + result_hash
-→ 检查本 Run 的相同调用次数、循环模式、总调用数与总耗时
-   ├─ 首次 / 有新参数或新结果：允许执行
-   ├─ 相同 Tool + 相同参数 + 相同结果重复 N 次：拒绝执行
-   └─ 达到调用 / Step / 时间 / Token / 成本预算：结束或降级
-```
-
-重复调用不应简单抛 Python Exception，而应返回模型可理解的 Observation：
-
-```json
-{
-  "status": "blocked",
-  "error_code": "RepeatedToolCall",
-  "message": "web_search with identical arguments already returned the same result twice; choose a different query or strategy."
-}
-```
-
-模型收到后可以改写 Query、切换 Tool、基于已有证据回答，或向用户说明限制；若仍继续重复，Harness 的 `max_tool_calls`、`max_steps`、`max_wall_time`、`max_tokens / cost` 会作为最终硬上限终止 Run。`Circuit Breaker` 是另一回事：它针对某个下游 Tool / 服务池整体不健康而暂停调用；单个 Agent Run 的重复调用属于 Loop Detection。
-
-最后，所有决定都写入 Tool Ledger / Trace：`tool_call_id`、policy、deadline、attempt、idempotency_key、错误类别、Loop 拦截原因和最终状态。这样可以解释“为什么没重试”“为什么被阻断”，也能调优每类 Tool 的超时与预算。
-
-**源码对照：** Pi 的 [Extensions 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)、[Permission Gate](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/permission-gate.ts) 和 [Protected Paths](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/protected-paths.ts) 适合对照 `before_tool`、权限拦截与受保护路径。
-
-## 3.4 MCP：远程工具的注册与调用
+## 3.3 MCP：远程工具的注册与调用
 
 MCP 和 Function Calling 位于不同边界：
 
@@ -1037,7 +920,7 @@ MCP
 
 ------
 
-## 3.5 Skill：通过 Tool Call 渐进式加载知识
+## 3.4 Skill：通过 Tool Call 渐进式加载知识
 
 Skill 是针对某类任务准备的程序性知识，例如代码审查、测试调试、数据分析或 PDF 生成。
 
@@ -1129,53 +1012,114 @@ load_skill Tool
 
 > Skill 是程序性知识，而 Skill Loading 本质上是一次标准 Tool Call。模型根据 Context 中的 Skill 名称和描述选择 Skill，再通过 `load_skill` 获取完整内容。
 
-这种方式不需要在 ReAct Loop 中增加特殊分支，所有加载过程仍然统一经过：
-
-```python
-result = await tool.execute(args, context)
-```
-
 **源码对照：** Pi 的 [Skills 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)。
 
-## 3.6 Tool-use 的生产级问题
+## 3.5 Tool Executor：从模型意图到可恢复的真实执行
 
-经典问题包括：
-
-- 参数校验失败时如何反馈给模型；
-- 只读和写操作如何采用不同并发策略；
-- 外部副作用如何做到幂等；
-- 工具超时后是否允许重试；
-- MCP Server 返回的内容是否可信；
-- Shell 输出过大时怎样截断并保存 Artifact；
-- 危险命令由 Policy 拒绝还是请求 Approval；
-- Tool 的凭证应该如何按需授权。
-
-这些问题都属于 Harness，而不是模型推理本身。
-
-## 3.7 工具调用的约束解码与校验
-
-工具调用的正确性是分层保证的：
+模型只负责生成 `tool_calls`，没有权限决定“能不能执行、重试几次、能等多久”。这些决策由 **Tool Registry 的静态策略**（下游 SLA、幂等能力和业务风险配置）与 **Executor 的运行时判断**共同完成：
 
 ```text
-Tool Schema
-  → Grammar / FSM 约束解码
-  → JSON 语法解析
-  → JSON Schema 语义校验
-  → 业务不变式校验
-  → Policy / Permission
-  → Tool Execute
+解析调用 → 约束与准入 → 执行与状态落库 → 重试 / 熔断处理 → 标准化 Result 回写
 ```
 
-约束解码将 JSON Schema 编译为 grammar 或有限状态机，在每个 decoding step 将不可能构成合法结构的 Token logits 设为 `-inf`。它可以保证括号、引号、枚举和字段类型等结构合法，但无法保证路径真实存在、金额合理、SQL 安全或用户有权操作，因此执行前校验不可省略。
+### 一次调用如何被安全执行
 
-工具 Schema 应尽量小而强：使用 `enum`、`required`、`additionalProperties: false`、数值范围和字符串 pattern；将危险动作拆分为「计划/预览」和「确认执行」两个 Tool；避免提供一个接收任意 shell 或 SQL 的万能工具。
+```text
+tool_call
+→ Resolve：Registry 找到 Function call / MCP Adapter
+→ 校验：JSON 解析、Schema、业务不变式
+→ Admit：ACL / Policy / Approval / Sandbox / Quota / Concurrency / Budget
+→ 状态/Ledger：PENDING → RUNNING，记录 deadline、attempt、idempotency_key
+→ Execute：受 Deadline 与 AbortSignal 控制
+→ Finish：Normalize Result → SUCCEEDED / FAILED / TIMEOUT / CANCELLED
+→ Tool Result：携带原始 tool_call_id 回给模型
+```
 
-**常见问题**
+其中 Runtime State 以 Executor 写回的真实状态和 Result 为准，模型不能声明“已经执行成功”。外部 MCP / Web 输出按不可信数据处理并限制大小；大结果转存 Artifact Store，只向 Context 回写摘要与 `artifact_id`。凭证由 Executor 最小权限、短时注入，绝不交给模型。
 
-1. **有 JSON Schema 校验，为什么还要约束解码？**
-   前者在生成后拒绝错误，后者在生成时屏蔽非法 Token，可以大幅减少结构修复。
-2. **约束解码能保证 Tool Call 正确吗？**
-   只能保证语法和部分 Schema 约束，不能保证工具选择、业务语义、资源存在性和操作权限。
+### Retry：只重试可恢复的瞬态故障
+
+最重要的判断是：
+
+> **Transient Error → Retry；Semantic Error → Replan。**
+
+只有“环境恢复后，同一次调用可能成功”的故障才可自动重试：网络超时 / 连接重置、临时 `429`、`5xx / 529 Overloaded`、MCP HTTP/SSE 断连或暂时不可用。策略采用**指数退避加随机抖动**，并设置最大重试次数和统一的重试预算。
+
+`InvalidArguments`、Schema Error、File Not Found、Test / Compile Failure、明确的 Auth / Permission Error、业务语义错误都不应盲目重试；它们以标准 Tool Result 回灌给模型，Agent 再改参数、修复任务或换 Tool。重试只能由一个最了解幂等语义的层级负责，通常是 Executor / Adapter，不能让 SDK、MCP Client 和 Agent Loop 各自重试。
+
+### 幂等与“状态未知”
+
+Retry 还必须判断动作是否可以安全重放。`Read`、`Search`、`GET`、`QueryStatus` 等只读操作通常天然幂等；`SendEmail`、`CreateOrder`、`Deploy`、`CreateIssue`、`Payment` 等写操作则不能把 Timeout 当作“未执行”。可能发生的是服务端已成功执行，但响应丢失，客户端才超时。
+
+因此写操作要携带 `idempotency_key` / `operation_id`，并在异常后查询 Ledger 或下游状态：
+
+```text
+Timeout
+→ Query operation status
+   ├─ SUCCESS     → 复用已有结果
+   ├─ NOT_STARTED → 可安全 Retry
+   └─ UNKNOWN     → UNKNOWN_SIDE_EFFECT，不自动重放
+```
+
+> **At-least-once Retry 必须配合 Idempotency，不能用重复副作用换可靠性。**
+
+### Timeout：限制单次调用，不等整个 Agent 卡死
+
+不同执行单元应有独立 Deadline：
+
+```text
+Model API Timeout
+Tool / Bash Timeout
+MCP Timeout
+Hook Timeout
+Background Subagent Stall Timeout
+Task / Run Deadline
+```
+
+单步 Timeout 负责把 Hang 变成显式 `TIMEOUT`；Task / Run Deadline 控制整个逻辑调用的生命周期。Retry 只能消费**剩余 Deadline**，不能每次重试都重新获得完整超时时间。例如 Task 总 Deadline 为 30 秒，前两次调用与退避已消耗 22 秒时，第三次最多只有 8 秒。
+
+```text
+Hang → Timeout → 按错误类别与幂等性分类
+     → Retry（可安全） / 标准 Tool Result（需 Replan）
+```
+
+### Circuit Breaker：局部依赖熔断 + Agent 全局熔断
+
+**局部 Circuit Breaker** 针对具体故障域，如 `web_search:serper`、`mcp:github`、`provider:openai`。维护滑动窗口健康状态：
+
+```text
+CLOSED -- failure / timeout rate 超阈值 --> OPEN
+OPEN -- cool_down --> HALF_OPEN -- probe success --> CLOSED
+                              └-- probe fail ------> OPEN
+```
+
+例如最近 60 秒内至少 20 次请求、失败率超过 50% 即 OPEN。OPEN 后新的 Tool Call 直接 Fast Fail 为 `CircuitOpen`，不再真实请求下游；HALF_OPEN 仅放少量 Probe。窗口只统计网络失败、timeout、可用性 `5xx` 与慢调用；参数错误、权限拒绝、用户取消、测试失败和模型调错 Tool 都不计入。一次逻辑 Tool Call 即使内部 Retry 多次，最终也只记录一次成功或失败，避免人为放大失败率。多实例时将窗口和状态置于 Redis / 共享存储并原子更新。
+
+**Agent 全局熔断**解决的是 ReAct Loop 自己不收敛：
+
+```text
+Tool A → Tool B → Tool C → Tool A → ...
+```
+
+Run 层维护 `max_turns`、`max_tool_calls`、`max_wall_time`、`max_tokens / max_cost`、`max_subagents` 与用户取消信号。任一 Budget 达到即停止进入下一轮 Model Call，返回 `RunBudgetExceeded`。同时可检测 `tool_name + arguments_hash + result_hash` 的重复模式：重复 N 次先返回 `RepeatedToolCall` 让模型 Replan；仍无进展则由全局 Budget 强制停止。
+
+> **Local Breaker 防止依赖拖死 Agent；Global Breaker 防止 Agent 自己拖死自己。**
+
+### 约束解码与服务端校验各解决什么
+
+```text
+Tool JSON Schema
+→ Grammar / FSM 约束解码
+→ JSON 解析
+→ Schema 校验
+→ 业务不变式 / 资源存在性校验
+→ Policy / Permission
+→ Execute
+```
+
+约束解码在生成时屏蔽不可能组成合法 JSON 的 Token，可保证结构、枚举、字段类型等部分约束；它不能保证路径存在、SQL 安全、金额合理或用户有权操作。因此 Schema 必须尽量小而强（`required`、`enum`、`additionalProperties: false`、范围 / pattern），危险动作最好拆为“计划 / 预览”和“确认执行”两个 Tool，服务端校验永远不能省。
+
+最终，Tool Result 必须带回原始 `tool_call_id`，并区分成功、参数错误、策略拒绝、可重试失败、超时取消和副作用未知等状态。Trace / Ledger 还应记录 policy、deadline、attempt、idempotency_key 与错误类别，才能解释“为什么没重试、为什么被拒绝、下次从哪里恢复”。
 
 # 四、Context Engineering
 
@@ -1185,20 +1129,20 @@ Context Engineering 解决的核心问题是：
 
 Context 不是持久状态本身，而是 Harness 从各类状态与数据源中构建出的**本轮模型输入**。
 
-## 4.1 Context Builder：从状态构造本轮输入
+## 4.1 Context Builder：从状态和工具调用结果构造本轮输入
 
-Environment 汇总本轮运行环境，包括 Thread State、Tool Results 和 Workspace 状态；Memory / RAG 提供长期记忆与检索信息。Context 只是 Context Builder 从这些来源中构造出的本轮模型输入快照：
+### Context 只保留“当前决策所需”，其余留在外部事实源
 
-```text
-Environment（Thread State + Tool Results + Workspace）
-                  + Memory / RAG
-                         ↓
-       Select → Deduplicate → Compress → Order → Budget
-                         ↓
-                 ModelInputContext
-```
+长任务中最危险的做法，是把“系统知道的一切”都拼进 Prompt。窗口有限，内容越多，Prefill 越慢、注意力越稀释；即使窗口足够大，后续压缩也可能改变历史 Token。因此 Context Builder 应遵循 **引用优先、按需展开、结果回写**：模型 Context 只放当前一步确实需要的信息，完整事实留在可查询的外部来源。
 
-输入在 Model Call 前冻结，并记录消息、Tool Schema、Memory 引用、Goal/Plan 版本和 Workspace Revision，用于复现、审计与回放。外部检索内容属于不可信数据，不能覆盖 System Policy。
+| 外部来源 | 保存什么 | 何时进入 Context |
+|---|---|---|
+| Thread State DB | Tool / Task 状态、已完成步骤、重试次数、产物引用 | 当前决策依赖执行进度时，投影结构化摘要而非完整日志 |
+| Workspace / Artifact Store | 文件、命令输出、大 Tool Result、截图与原始证据 | 模型通过 `read_file` / `artifact_read` 按需读取片段；Context 保留路径、摘要与 artifact ID |
+| Memory / RAG | 用户偏好、稳定决策、知识库证据 | 由 Harness 或模型 Tool 检索少量高相关内容 |
+| Subagent Run | 最终结果、中间 Observation、失败与风险 | 主 Agent 只接收最终结论、证据/产物引用、风险与未解决问题 |
+
+这也解释了为什么压缩不会等于“遗忘”：被压缩的是模型可见的消息表示，原始工具结果、持久化文件和 Artifact 仍是事实来源。需要核验细节时，Agent 应重新读取外部引用，而不是假设 Summary 能保存所有原文。
 
 ## 4.2 上下文三层结构
 
@@ -1216,9 +1160,15 @@ Environment（Thread State + Tool Results + Workspace）
 └──────────────── 动态末尾：本轮 Query / Tool Result / Retrieval，每轮新增
 ```
 
-这三段是模型输入的**物理布局**，前面的 Thread、Memory、Workspace、Retrieval 是信息的**逻辑来源**。例如 RAG 结果首次出现时位于动态末尾；任务推进后，有价值的结论进入中间历史，原文则转存 Artifact；真正长期稳定的用户事实也可以沉淀到 Memory，但不会因此自动塞进固定前缀。Skill Catalog 是固定前缀的一部分，按需 `load_skill` 后的完整 Skill 内容则作为后续 Tool Result 进入消息历史。
+其中中间历史的本体是按时间追加的 `messages[]`：每一项都是 `message { role, content }`。用户输入为 `role=user`；模型输出 Tool Call 时为 `role=assistant` 的结构化 `content`；执行结果以带原始 `tool_call_id` 的 `role=tool` 消息写回。因此 Tool 调用不是脱离对话历史的一条旁路，而是同一条消息序列中的一个闭环。
 
-这种布局同时服务两件事：长上下文中常见的“首尾更容易被模型利用”现象，以及 Prefix Cache 复用。前者不能简单归因于因果注意力：因果注意力只规定 token 只能访问左侧；位置偏置、训练数据分布、近期信息与长上下文退化共同造成了类似 U 型的利用率。后者要求从开头到变化点之前的 Token 连续一致，因此固定前缀必须稳定，消息历史也应以 append 为主。
+这三段只是模型输入 Context 的**堆栈布局**；这种布局同时服务两件事：长上下文中常见的“U 型注意力“ 即首尾更容易被模型利用现象，以及 Prefix Cache 命中。
+
+Thread State、State DB、Workspace / File System、Artifact Store、Memory 与 Retrieval 是 Agent 可依赖的外部来源。Context 应采用“**外部引用 + 按需加载**”而不是全量载入上下文：完整文件、大 Tool Result、事件记录和检索原文持久化在外部，模型当前只保留路径 / `artifact_id`、摘要、证据引用或少量高相关片段；需要细节时再通过 `read_file`、`artifact_read`、RAG 或状态查询取回。
+
+
+
+![Agent Context Engineering：分层输入、外部事实源与 Prefix Cache](figures/agent-context-engineering-architecture.png)
 
 窗口预算不能用字符数估算，必须使用目标模型 Tokenizer，并预留输出、Tool Schema 变化和 safety margin：
 
@@ -1231,45 +1181,118 @@ input_budget = context_window
 
 对过大 Tool Result，原文写入 Artifact Store，Context 中仅保留结构化摘要、关键证据和可再读取的 artifact ID，避免每轮重复携带。
 
-## 4.3 Context Compression
+## 4.3 Agent 上下文剪裁与压缩：Micro → Auto → Reactive
 
-长任务不能无限追加全部历史。压缩的主要目标是三层中的**历史消息层**，不是平均裁剪整个 Context：
+长任务不能无限追加全部历史，但“超过阈值就把所有消息总结一次”太粗糙。更接近 Claude Code 风格的设计，是把 Context 管理分为三类问题：
 
-- 固定前缀保持字节与顺序不变，避免破坏长期约束和 Prefix Cache；
-- 动态末尾保留原文，避免丢失指代关系、最新反馈和工具交互细节；
-- 已封闭的中间历史分段压缩为 Summary；
-- 超长 Tool Result 只保留摘要和 Artifact 引用；
-- 去除重复日志、过期 Plan 和重复文件片段；
-- Subagent 只返回结论、Evidence 和未解决问题；
-- Goal、Plan、Task 使用结构化状态，而不是反复注入长文本。
+> **Observation 太多，Conversation 太长，或 Context 已经溢出。**
+> 它们分别用低损耗剪裁、语义压缩和异常截断处理。
 
-压缩不能只保留最后若干 Token，否则可能删除早期的重要约束。更合理的原则是：
+无论哪种机制，主要目标都是三层中的**中间历史消息层**：固定前缀保持字节与顺序不变，动态末尾保留最近原文；完整 Tool Result、文件与事件始终留在 Artifact / Event Store 中，而不是依赖 Summary 当事实源。
 
-> 保留任务目标、关键决策、当前状态和必要证据，压缩重复过程与低价值中间信息。
-
-### 4.3.1 水位触发与结构化摘要
-
-压缩应由水位触发，而不是每轮都重写历史。可设置两级阈值：
-
-- **soft waterline**：停止注入低相关检索内容，将大 Tool Result 转为 Artifact；
-- **hard waterline**：对旧历史执行结构化摘要，必要时裁剪可再获取内容。
-
-一份可恢复的摘要应包含：
-
-```yaml
-goal: 当前目标与验收条件
-constraints: 不可违反的约束
-decisions: 已做决策及理由
-facts: 已验证事实与来源
-completed: 已完成工作
-pending: 未完成工作
-failures: 失败尝试与不应重复的路径
-artifacts: 可再读取的外部内容引用
+```text
+每轮 Model Call 前
+  → Micro Compact：去掉可重新获取的旧 Observation
+  → 正常继续 append History
+  → 达到 Auto Compact 水位
+      → 优先 Session Memory 替换旧 History
+      → 不足则 Legacy LLM Summary
+  → 若突增导致 Prompt Too Long
+      → Reactive Compact 紧急截断并重试
+  → Post-Compact Cleanup：修正 Runtime 与 Context 标记
 ```
 
-压缩后必须做不变式检查：系统约束是否仍存在、Goal 是否一致、所有未完成 Tool Call 是否有状态、关键结论是否能追溯到证据。摘要应带版本和覆盖的 Event 范围，避免重复压缩产生漂移。
+![Agent 上下文压缩的渐进式机制](figures/agent-context-compaction-lifecycle.png)
 
-## 4.4 Context Compression 与 Prefix Cache 的协同
+### Micro Compact：日常低成本剪裁，不调用 LLM
+
+每轮 Model Call 前，Harness 都可以检查旧的 Tool Result 是否仍值得占用 Context。`Read`、`Grep`、`Glob`、`Bash`、Web Search 等 Observation 往往很大，但其原文已经在文件系统、Artifact Store 或外部服务中可重新获取。Micro Compact 只把这类**低价值原始 Observation**替换为简短占位、结构化摘要或 artifact ID；它不总结任务语义，也不改写 Goal、决策和最近推理。
+
+```text
+旧 read_file(file=app.py, 8000 tokens)
+        ↓
+Context 中保留："已读取 app.py 的鉴权逻辑；artifact://run/42/file/7"
+原始内容保留：Artifact Store / Workspace
+```
+
+实践中可分两条路径：
+
+- **Cache-aware Micro Compact**：若 Provider 支持 Prompt Cache 编辑或服务端缓存引用，优先在缓存层标记 / 替换旧 Observation，尽量不改客户端完整 History，从而保留已有 Prefix / KV Cache；
+- **Time-based Micro Compact**：若长时间没有交互、Prompt Cache 已自然失效（例如超过约 60 分钟），再直接改写本地 History 中的旧 Observation。此时没有必要为了旧 Cache 保留大段无用原文。
+
+所以 Micro Compact 的本质是：**删 Raw Observation，不做语义总结。**它成本低、可以高频执行，但只能延缓增长，不能替代真正的会话压缩。
+
+### Auto Compact：接近窗口时主动重构会话
+
+当输入 Token 达到 Auto Compact 水位（例如预留输出与 Tool Schema 后超过可用预算的 75%～80%），才触发宏观压缩。压缩目标应带滞回：例如从 80% 压回 50%～60%，避免每轮都在阈值附近重复压缩。
+
+优先采用两级策略：
+
+1. **Session Memory Compact**：Agent 正常运行时，后台异步 Subagent 可以持续从Context / Event / State 中提取稳定记忆：用户目标与约束、关键决策、已验证事实、当前进度、失败路径和 Artifact 引用等。生成并持久化为版本化 Session Memory。触发压缩时，直接用 Session Memory 替换较早 Chat History，最近 Messages 保持原文；压缩当下不必临时读取全部历史再调用模型。它并非 Zero-LLM，而是把 LLM 成本从阻塞路径前移。
+2. **Legacy Compact 降级**：若 Session Memory 缺失、提取失败或释放空间不足，才对封闭的远端 Conversation 调用模型生成结构化摘要，并重构为：
+
+```text
+[Session Memory / Historical Summary]
+  + [Compact Boundary：覆盖的 Event Range、版本、Artifact 引用]
+  + [Recent Messages 原文]
+```
+
+通用 Agent 的摘要字段应能覆盖目标、领域语义、工作区记录、问题进展及后续动作；其中 Workspace 不只指 Coding Agent 的文件，也包括 Artifact、Tool / Task 状态、DB 记录和其他外部资源。一份统一的九段式摘要可采用以下结构：
+
+```yaml
+primary_request_and_intent: 用户的核心需求、意图与验收条件
+key_domain_concepts: 涉及的领域知识、术语与关键概念
+workspace_records: 文件、代码片段、修改记录、Artifact、Tool / Task 状态、DB 或外部资源引用
+errors_and_fixes: 遇到的错误、失败尝试与修复方案
+problem_solving: 已解决与仍在排查的问题、关键决策及理由
+all_user_messages: 所有非 Tool Result 的用户消息原文及其 Event / Message 引用
+pending_tasks: 待完成任务
+current_work: 压缩前正在进行的工作
+optional_next_step: 可选的下一步计划
+```
+
+#### 独立模型压缩的 XML 输出契约
+
+Legacy Compact 不应只要求“总结以上对话”。独立的压缩模型需要输出可审计、可恢复的结构化结果；可约定返回两个 XML 块：
+
+```xml
+<analysis>
+  <!-- 按时间顺序审计消息：用户意图、领域概念、工作区变化、问题与修复、任务进展及外部引用。 -->
+</analysis>
+<summary>
+  <!-- 可直接替换封闭 History 的正式摘要。 -->
+</summary>
+```
+
+- **`<analysis>` 块**：压缩任务的工作草稿，按时间顺序核对每条 Message，提取用户意图、领域概念、工作区变化、问题与修复、任务进展及外部引用。生产环境不应将其当作模型私有推理链长期持久化，只保留对任务恢复有价值的结构化审计信息即可。
+- **`<summary>` 块**：正式、稳定的会话摘要，供 Context Builder 在后续 Turn 中加载。字段严格遵循上方统一的九段式 YAML Schema，避免摘要随模型风格漂移。
+
+
+关键原则是：**远端历史做 Summary，最近执行上下文保留原文；需要细节时按 artifact / state 引用重新读取。**压缩后需检查系统约束、Goal、未完成 Tool / Task 状态与关键证据引用是否仍存在。
+
+### Reactive Compact：Prompt Too Long 的异常兜底
+
+Auto Compact 也可能来不及。例如一次 `Read` 返回超大文件，或检索结果突然暴涨，直接触发 `413 Prompt Too Long`。此时目标不是生成高质量摘要，而是先让 Agent 从 Context Overflow 中恢复：优先裁掉最旧、可重新获取的 API rounds / Tool Results，保留 System、当前 Goal、最近 Messages 与未完成状态，然后重建请求。
+
+```text
+Model Request → 413 Prompt Too Long
+      ↓
+按优先级紧急剔除：旧 Raw Observation → 旧 API Rounds → 低相关 Retrieval
+      ↓
+保留：System / Active Tool / Goal / Running Task / Recent Messages
+      ↓
+重新发起 Model Call
+```
+
+Reactive Compact 通常不等待后台 Subagent，也不应再阻塞调用 LLM 做长摘要：它延迟低、信息损失最大，是最后一道故障恢复，而不是常规压缩策略。
+
+### Post-Compact Cleanup：防止“模型忘了，Runtime 还以为记得”
+
+压缩改变的是 Model Context，不会自动改变 Runtime State。比如 Runtime 记录“`foo.py` 已读取”，但对应 Result 已被从 Context 剪掉；若仍阻止模型再次读取，下一轮就会出现状态断裂。
+
+因此压缩后应清理或降级与可见上下文绑定的标记，例如 `read_file_state`、过期的状态标记，并保留 State DB 中真实的 Tool / Task 事实。后续模型若需要详情，可以安全地重新调用 `read_file` / `artifact_read`；不要让 Runtime 假设模型仍记得被裁剪的 Observation。
+
+### Context Compression 与 Prefix Cache 的协同
 
 冲突的根源是：历史压缩会改写 Token，而 Prefix Cache 只能复用从开头连续一致的 Token。若每轮都重新总结整段会话，摘要后面的 Token 即使没有变化，也会因前缀断裂而全部失去命中。
 
@@ -1304,7 +1327,7 @@ PagedAttention 为 KV Block 的独立保留、引用和回收提供存储基础�
    同时看任务成功率、关键事实保留率、压缩延迟、输入 Token 和 cached tokens，不能只看压缩比。
 
 
-## 4.5 RAG：从全量知识到有限 Context
+## 4.4 RAG：从全量知识到有限 Context
 
 RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 内，尽可能找到支持当前任务的证据。一条完整链路包含：
 
@@ -1318,7 +1341,7 @@ RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 
        → 生成与引用
 ```
 
-### 4.5.1 文档处理与分块
+### 4.4.1 文档处理与分块
 
 分块决定了检索的最小语义单元。块太小，召回内容缺少上下文；块太大，Embedding 主题被稀释，也会浪费 Context。
 
@@ -1331,7 +1354,7 @@ RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 
 
 对层级知识，只索引叶子名称往往不够。例如「正弦定理」在不同学科目录中可能有歧义，把「学科 / 章节 / 小节 / 知识点」完整路径与名称、描述一起索引，可以同时增强关键词与语义信号。
 
-### 4.5.2 BM25 稀疏召回
+### 4.4.2 BM25 稀疏召回
 
 BM25 基于词项匹配，特别擅长处理专有名词、缩写、型号、代码符号和准确关键词。常用形式为：
 
@@ -1350,7 +1373,7 @@ $$
 
 BM25 的弱点是无法自然识别同义改写。「显存溢出」和「GPU OOM」语义接近，但字面可能几乎不重合。
 
-### 4.5.3 Embedding 向量召回
+### 4.4.3 Embedding 向量召回
 
 向量召回将 Query 与 Chunk 编码到同一向量空间，通过 cosine similarity 或 inner product 检索语义近邻。大规模索引通常使用 HNSW、IVF 等 ANN 结构，用少量精度换取检索速度。
 
@@ -1363,7 +1386,7 @@ BM25 的弱点是无法自然识别同义改写。「显存溢出」和「GPU OO
 - 先做权限和元数据过滤，不能将无权结果召回后再交给模型判断；
 - 分数是相对相似度，不是可直接解释的正确率。
 
-### 4.5.4 混合召回与 RRF
+### 4.4.4 混合召回与 RRF
 
 稀疏召回擅长字面精确匹配，向量召回擅长语义匹配，两路结果互补。但 BM25 与 cosine similarity 的分数尺度不同，不宜直接相加。
 
@@ -1390,7 +1413,7 @@ def rrf(rank_lists, k=60):
     return sorted(scores, key=scores.get, reverse=True)
 ```
 
-### 4.5.5 Candidate Generation 与 Rerank
+### 4.4.5 Candidate Generation 与 Rerank
 
 召回阶段的目标是「尽量不漏」，通常生成几十到几百个候选；精排阶段的目标是「把最相关的放前面」。
 
@@ -1400,7 +1423,7 @@ def rrf(rank_lists, k=60):
 
 如果生产目标是输出唯一结果，召回层仍应优化 Recall@K，判别层再优化 Top-1 Accuracy。候选集里没有正确答案时，后续模型不可能挽回。
 
-### 4.5.6 Hard Negative
+### 4.4.6 Hard Negative
 
 随机负样本往往太简单，模型只需学会粗粒度主题区分。Hard Negative 应该「很像正确答案，但在关键属性上错误」，可以来自：
 
@@ -1411,7 +1434,7 @@ def rrf(rank_lists, k=60):
 
 但需要防止 false negative：标注本身不完整时，高相似候选可能实际也是正确答案。高风险 Hard Negative 应经过人工或教师模型一致性校验。
 
-### 4.5.7 评估与线上运行
+### 4.4.7 评估与线上运行
 
 | 阶段 | 关键指标 | 回答的问题 |
 |---|---|---|
@@ -1433,7 +1456,7 @@ def rrf(rank_lists, k=60):
 3. **Recall@K 很高，为什么最终结果仍然可能差？**
    Recall@K 只说明正确答案进了候选集，不保证判别模型能把它选为 Top-1，也不保证生成阶段不歪曲证据。
 
-## 4.6 Memory：全局持久化记忆层
+## 4.5 Memory：全局持久化记忆层
 
 Memory 不是 Context 的同义词，也不是脱离 Thread 的“第二个大脑”。在本文架构中：
 
@@ -1486,7 +1509,7 @@ Harness 自动读写
 
 Harness 自动读取适合稳定偏好和明显相关的项目事实，自动写入适合从每轮新增 Context 与 Event 中持续沉淀长期信息。模型主动读取适合推理中临时发现缺少历史决策或经验；主动写入适合用户明确要求记住、形成稳定决策或完成已验证流程。模型可以决定读写什么，但真正的访问仍由 Harness 执行和约束。
 
-### 4.6.1 User Memory 的内部层次
+### 4.5.1 User Memory 的内部层次
 
 可以把用户级 Memory 分成四类：
 
@@ -1499,7 +1522,7 @@ Harness 自动读取适合稳定偏好和明显相关的项目事实，自动写
 
 原始对话、完整 Tool Result 和临时猜测不应自动成为 Memory。它们需要经过抽取、验证和整合，才适合跨 Thread 使用。
 
-### 4.6.2 Memory Tool 的调用原型
+### 4.5.2 Memory Tool 的调用原型
 
 先看模型可见的调用形式：
 
@@ -1550,7 +1573,7 @@ def memory_write(
 
 `thread_id`、用户身份和 ACL 不应由模型作为参数传入，而应由 Harness 的 `ToolContext` 注入，防止模型越权访问其他 Thread。
 
-### 4.6.3 Memory Write Pipeline
+### 4.5.3 Memory Write Pipeline
 
 ```text
 Turn / Task / Confirmed Decision Event
@@ -1580,7 +1603,7 @@ class MemoryItem:
 
 不是所有历史都应写入 Memory。临时日志、未经验证的猜测和一次性中间状态通常不值得保存。
 
-### 4.6.4 Memory Retrieval Pipeline
+### 4.5.4 Memory Retrieval Pipeline
 
 Memory 的难点不是“能存多少”，而是当前任务到来时应该召回哪些内容。
 
@@ -1638,7 +1661,7 @@ score = (
 
 召回 100 条不等于注入 100 条。最终仍要去重并服从 Token Budget。
 
-### 4.6.5 冲突、整合与遗忘
+### 4.5.5 冲突、整合与遗忘
 
 长期 Memory 必须治理：
 
