@@ -1341,7 +1341,7 @@ RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 
        → 生成与引用
 ```
 
-### 4.4.1 文档处理与分块
+### 文档处理与 Chunk 划分
 
 分块决定了检索的最小语义单元。块太小，召回内容缺少上下文；块太大，Embedding 主题被稀释，也会浪费 Context。
 
@@ -1354,7 +1354,7 @@ RAG 的核心不是「搜到几段文本」，而是在有限的 Context Budget 
 
 对层级知识，只索引叶子名称往往不够。例如「正弦定理」在不同学科目录中可能有歧义，把「学科 / 章节 / 小节 / 知识点」完整路径与名称、描述一起索引，可以同时增强关键词与语义信号。
 
-### 4.4.2 BM25 稀疏召回
+### BM25 稀疏召回
 
 BM25 基于词项匹配，特别擅长处理专有名词、缩写、型号、代码符号和准确关键词。常用形式为：
 
@@ -1373,11 +1373,11 @@ $$
 
 BM25 的弱点是无法自然识别同义改写。「显存溢出」和「GPU OOM」语义接近，但字面可能几乎不重合。
 
-### 4.4.3 Embedding 向量召回
+### Embedding 向量召回
 
 向量召回将 Query 与 Chunk 编码到同一向量空间，通过 cosine similarity 或 inner product 检索语义近邻。大规模索引通常使用 HNSW、IVF 等 ANN 结构，用少量精度换取检索速度。
 
-工业上可用 OpenAI 的 `text-embedding-3-small` 处理高吞吐、成本敏感检索，或用 `text-embedding-3-large` 获得更强的多语言语义表征；向量可存入 **Milvus**、Elasticsearch `dense_vector` 或 **pgvector**，并以 HNSW / IVF 完成 ANN 检索。
+工业上可用 OpenAI 的 `text-embedding-3-small` 处理高吞吐、成本敏感检索，或用 `text-embedding-3-large` 获得更强的多语言语义表征；向量可存入 Milvus、Elasticsearch `dense_vector` 或 pgvector，并以 HNSW / IVF 完成 ANN 检索。
 
 工程上要注意：
 
@@ -1386,7 +1386,7 @@ BM25 的弱点是无法自然识别同义改写。「显存溢出」和「GPU OO
 - 先做权限和元数据过滤，不能将无权结果召回后再交给模型判断；
 - 分数是相对相似度，不是可直接解释的正确率。
 
-### 4.4.4 混合召回与 RRF
+### 混合召回与 RRF
 
 稀疏召回擅长字面精确匹配，向量召回擅长语义匹配，两路结果互补。但 BM25 与 cosine similarity 的分数尺度不同，不宜直接相加。
 
@@ -1413,7 +1413,7 @@ def rrf(rank_lists, k=60):
     return sorted(scores, key=scores.get, reverse=True)
 ```
 
-### 4.4.5 Candidate Generation 与 Rerank
+###  Candidate Generation 与 Rerank
 
 召回阶段的目标是「尽量不漏」，通常生成几十到几百个候选；精排阶段的目标是「把最相关的放前面」。
 
@@ -1423,7 +1423,7 @@ def rrf(rank_lists, k=60):
 
 如果生产目标是输出唯一结果，召回层仍应优化 Recall@K，判别层再优化 Top-1 Accuracy。候选集里没有正确答案时，后续模型不可能挽回。
 
-### 4.4.6 Hard Negative
+### Hard Negative
 
 随机负样本往往太简单，模型只需学会粗粒度主题区分。Hard Negative 应该「很像正确答案，但在关键属性上错误」，可以来自：
 
@@ -1434,7 +1434,7 @@ def rrf(rank_lists, k=60):
 
 但需要防止 false negative：标注本身不完整时，高相似候选可能实际也是正确答案。高风险 Hard Negative 应经过人工或教师模型一致性校验。
 
-### 4.4.7 评估与线上运行
+### 评估与线上运行
 
 | 阶段 | 关键指标 | 回答的问题 |
 |---|---|---|
@@ -1456,223 +1456,52 @@ def rrf(rank_lists, k=60):
 3. **Recall@K 很高，为什么最终结果仍然可能差？**
    Recall@K 只说明正确答案进了候选集，不保证判别模型能把它选为 Top-1，也不保证生成阶段不歪曲证据。
 
-## 4.5 Memory：全局持久化记忆层
+## 4.5 Memory
 
-Memory 不是 Context 的同义词，也不是脱离 Thread 的“第二个大脑”。在本文架构中：
+Memory 不是一个统一向量库，更不是 Context 的同义词。通用 Agent 更适合按生命周期与语义分成四层：
 
-> **Memory 属于用户级全局持久化数据，可以跨 Thread 复用；Goal、Plan、Task 属于单个 Thread 的 Durable State。Memory 同时支持 Harness 自动读写和模型通过 Tool 主动读写，两条路径共用权限、证据、Scope、去重与冲突处理。**
+| 层 | 保存什么 | 典型载体 |
+| --- | --- | --- |
+| **Instruction Memory** | 长期规则、偏好、项目规范、权限边界 | `AGENTS.md` / User Profile |
+| **Long-term Memory** | 跨会话的偏好、反馈、决策、经验与参考入口 | KV / DB，规模大时 Hybrid Index |
+| **Session Memory** | 当前 Goal、进展、决策、失败路径、下一步 | 结构化 Session Summary |
+| **External State** | 文件、Artifact、Task / Tool 状态、执行账本 | Workspace / DB |
 
-```mermaid
-flowchart TB
-    subgraph AUTO["Harness 自动读写"]
-        direction LR
-        EVENT["Turn / Task Event"] --> EXTRACT["抽取、校验与去重"]
-        EXTRACT --> STORE1[("User Memory")]
-        INPUT1["当前任务"] --> CB["Context Builder"]
-        CB --> STORE1
-        STORE1 --> SELECT["检索与筛选"]
-        SELECT --> CTX["Model Context"]
-    end
+> **Memory 记录 Agent 应该记住什么；External State 记录世界实际上发生了什么。Context Builder 决定模型能看到什么**。
 
-    subgraph ACTIVE["模型通过 Tool 主动读写"]
-        direction LR
-        MODEL2["Model"] --> CALL["memory_search / memory_write"]
-        CALL --> TOOL["Harness / Memory Tool"]
-        TOOL --> STORE2[("User Memory")]
-        STORE2 --> RESULT["Tool Result"]
-        RESULT --> MODEL2
-    end
+例如“测试已经通过”必须由 Tool Ledger 证明；Memory 只能记录该结论的来源或后续经验，不能替代真实状态。
 
-    CTX ~~~ MODEL2
+### 何时读取
 
-    classDef store fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.4px;
-    classDef process fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.4px;
-    classDef context fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.6px;
-    classDef model fill:#EEF2FF,stroke:#4F46E5,color:#312E81,stroke-width:1.6px;
-    class STORE1,STORE2 store;
-    class EVENT,EXTRACT,SELECT,CALL,RESULT process;
-    class INPUT1,CB,CTX,TOOL context;
-    class MODEL2 model;
+- **Instruction Memory**：每个 Session 自动读取少量高权威规则，不依赖聊天摘要保存。
+- **Long-term Memory**：当前 Query / Goal / Task 涉及特定主题时，再按 Scope、相关性、新鲜度与重要度检索偏好、决策、反馈和参考入口；需要详情时沿引用读取原始证据。
+- **Session Memory**：随着任务推进更新，保存当前稳定进度；它服务长任务续跑与 Auto Compact，具体压缩与上下文重建逻辑见 4.3 节。
+
+作用域至少区分 `global / user / organization / project / task-session`；越贴近当前任务的记录优先级越高。例如全局偏好“中文回答”不能覆盖项目级规则“本仓库用英文提交信息”。
+
+### 何时写入、如何治理
+
+Memory 既可由 Harness 自动沉淀，也可由模型通过 `memory_search` / `memory_write` Tool 主动请求；两条路径都要经过同一套 Scope、ACL、证据、去重和冲突校验。
+
+Harness 自动写入适合用户明确偏好、确认过的长期约束和已验证决策；模型主动读取适合推理中发现缺少历史背景，主动写入则只应发生在用户明确要求记住或形成稳定、已验证结论时。
+
+不要把所有对话、完整 Tool Result、Event Log、随时可重新搜索的事实或模型猜测写入长期 Memory。简单判断是：**未来重新获取成本高，且跨 Session 大概率仍会用到，才值得记。**
+
+每条长期记录至少应具备：
+
+```yaml
+memory_id: mem_123
+scope: project
+type: preference | decision | feedback | reference
+content: 用户偏好 pytest
+source_ref: message_123 / event_456
+confidence: 1.0
+importance: 0.9
+version: 2
+status: active | superseded | expired
 ```
 
-两种方式都同时包含读取和写入：
-
-```text
-Harness 自动读写
-读取：Context Builder → 检索 User Memory → 筛选少量内容 → Model Context
-写入：Turn / Task Event → 抽取候选 → 校验、去重与冲突处理 → User Memory
-
-模型通过 Tool 主动读写
-读取：Model → memory_search → Harness / Memory Tool → Tool Result
-写入：Model → memory_write → Harness 校验 → User Memory → Tool Result
-```
-
-Harness 自动读取适合稳定偏好和明显相关的项目事实，自动写入适合从每轮新增 Context 与 Event 中持续沉淀长期信息。模型主动读取适合推理中临时发现缺少历史决策或经验；主动写入适合用户明确要求记住、形成稳定决策或完成已验证流程。模型可以决定读写什么，但真正的访问仍由 Harness 执行和约束。
-
-### 4.5.1 User Memory 的内部层次
-
-可以把用户级 Memory 分成四类：
-
-| 类型              | 保存什么                           | 示例                                           |
-| ----------------- | ---------------------------------- | ---------------------------------------------- |
-| Preference Memory | 用户长期偏好与交互习惯             | 用户偏好 PyTorch，技术文档希望先讲主线再给代码 |
-| Semantic Memory   | 稳定背景事实与项目约定             | 该用户的仓库统一使用 UTC 存储时间              |
-| Decision Memory   | 跨 Thread 仍有效的决策、约束和理由 | 不修改公共 API，因为下游服务依赖当前签名       |
-| Procedure Memory  | 已验证有效、可复用的执行经验       | 该项目使用 `uv run pytest` 才能复现 CI 环境    |
-
-原始对话、完整 Tool Result 和临时猜测不应自动成为 Memory。它们需要经过抽取、验证和整合，才适合跨 Thread 使用。
-
-### 4.5.2 Memory Tool 的调用原型
-
-先看模型可见的调用形式：
-
-```javascript
-memory_search({
-  query: "这个仓库过去如何处理 naive datetime？",
-  kinds: ["semantic", "decision"],
-  topK: 5
-})
-
-memory_write({
-  kind: "semantic",
-  content: "该仓库持久层统一存储 UTC，展示层负责时区转换。",
-  evidenceEventIds: ["event_tool_result_42"],
-  confidence: 0.96
-})
-```
-
-`memory_search` 和 `memory_write` 都是模型可见的 Tool；Harness 从 `ToolContext` 注入用户、Thread 和 ACL，并在真正访问 Memory Store 前统一校验。
-
-对应的 Python 函数原型可以非常简单：
-
-```python
-from typing import Literal
-
-MemoryKind = Literal["episodic", "semantic", "decision", "procedure"]
-
-def memory_search(
-    query: str,
-    *,
-    kinds: list[MemoryKind] | None = None,
-    top_k: int = 5,
-) -> list["MemoryItem"]:
-    """在 ToolContext.user_id 对应的 User Memory 中检索。"""
-    ...
-
-
-def memory_write(
-    content: str,
-    *,
-    kind: MemoryKind,
-    evidence_event_ids: list[str],
-    confidence: float = 0.8,
-) -> "MemoryItem":
-    """校验并写入带来源与版本的长期记忆。"""
-    ...
-```
-
-`thread_id`、用户身份和 ACL 不应由模型作为参数传入，而应由 Harness 的 `ToolContext` 注入，防止模型越权访问其他 Thread。
-
-### 4.5.3 Memory Write Pipeline
-
-```text
-Turn / Task / Confirmed Decision Event
-→ Candidate Extraction（规则或模型抽取）
-→ Evidence Validation
-→ 稳定性判断
-→ 去重 / 冲突检测
-→ User Scope 与 ACL
-→ 人工确认（必要时）
-→ 持久化与版本化
-```
-
-Harness 自动写入会从 Turn / Task Event 开始执行完整流水线；模型调用 `memory_write` 时从候选记忆进入，但同样不能绕过证据、Scope、去重与冲突校验。生产系统还可以通过规则直接捕获高置信事件，例如用户显式修改偏好、确认长期约束或将方案标记为已验证。
-
-```python
-@dataclass
-class MemoryItem:
-    id: str
-    user_id: str
-    source_thread_id: str
-    kind: MemoryKind
-    content: str
-    source_event_ids: list[str]
-    confidence: float
-    version: int
-```
-
-不是所有历史都应写入 Memory。临时日志、未经验证的猜测和一次性中间状态通常不值得保存。
-
-### 4.5.4 Memory Retrieval Pipeline
-
-Memory 的难点不是“能存多少”，而是当前任务到来时应该召回哪些内容。
-
-### Query Construction
-
-不要只使用最后一句用户输入。Query 可以组合：
-
-```text
-当前 User Input
-当前 Thread Goal
-Current Task
-相关文件路径
-最近错误信息
-Active Skill
-```
-
-```python
-query = combine(
-    user_input,
-    thread.goal.objective,
-    current_task(thread.tasks).title,
-    touched_files,
-    recent_errors,
-)
-```
-
-### Hybrid Retrieval 与 Rerank
-
-```text
-Keyword / BM25
-    文件路径、命令、错误码、版本号
-
-Embedding
-    语义相似的偏好、经验和决策
-
-Metadata
-    Kind、Namespace、来源、可信度、时间
-
-Usage Signal
-    最近使用时间、过去是否真正帮助过任务
-```
-
-一个简单的重排评分：
-
-```python
-score = (
-    semantic_relevance * 0.40
-    + keyword_match * 0.20
-    + namespace_match * 0.15
-    + confidence * 0.10
-    + freshness * 0.10
-    + past_utility * 0.05
-)
-```
-
-召回 100 条不等于注入 100 条。最终仍要去重并服从 Token Budget。
-
-### 4.5.5 冲突、整合与遗忘
-
-长期 Memory 必须治理：
-
-- 新旧事实冲突时保留版本、来源和时间；
-- 不确定结论不应伪装成事实；
-- 多条重复 Memory 应 Consolidate 为更稳定的表达；
-- 长期未使用且低价值的内容应降低权重；
-- Thread 分叉时应明确哪些 Memory 被继承、复制或重新验证；
-- 用户应能够查看、修改和删除当前 Thread 的 Memory。
-
-**源码对照：** Codex 的 [Memory Pipeline](https://github.com/openai/codex/blob/main/codex-rs/core/src/memories/README.md) 可用于理解 Extraction、Consolidation、使用次数与新鲜度筛选等工程机制。
+当用户在同一项目中把“使用 pytest”改为“使用 unittest”，新记录应带更具体 Scope 并将旧记录标为 `superseded`，而不是让两个冲突结论同时召回。Memory 生命周期可概括为：`Capture → Consolidate → Retrieve → Forget`；通过去重、版本、TTL 和低价值归档抑制 Memory Pollution。
 
 # 五、Goal / Plan：持久化控制状态
 
