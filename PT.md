@@ -1,636 +1,68 @@
-# 大模型基础、后训练与推理工程
+## 一、Transformer 基础
 
-> **面试前主线：**先建立“模型如何表示与生成”→“如何用数据把模型训成可用助手”→“如何在 GPU 上高效、稳定地服务”的叙事。公式和实现用于支撑解释，而不是逐行背诵。
+### 1 输入表征与位置编码
 
-## 一、Transformer 与多模态基础
+#### 1.1 为什么需要位置编码
 
-> **主线：**Transformer 用 Attention 建模 Token 间关系，Decoder-Only 用因果 Mask 按序生成；多模态模型再把图像编码为可被 LLM 消费的视觉 Token。
+Self-Attention 自身只比较内容，天然不知道 Token 的先后顺序。位置编码的区别，核心不在“有没有位置”，而在于：**位置写进输入表征、写进 QK 打分，还是通过旋转 Q/K 写入注意力计算。**
 
-### 1 从 RNN 到 Transformer
+| 类型 | 位置注入点 | 一句话理解 | Attention 最容易得到什么 |
+| --- | --- | --- | --- |
+| 绝对位置编码 | 输入表征层 | 给第 `m` 个 Token 一张“第 m 位”的位置名片 | 绝对位置；相对距离需模型自行推导 |
+| 相对位置编码 | QK 打分 | 直接告诉模型“两个 Token 相距多少” | 相对距离与方向 |
+| RoPE | Q、K 投影后、QK 打分前 | 将每对 Q/K 分量按当前位置旋转 | 单个 Q/K 带绝对位置；内积天然感知相对距离 |
 
-#### 1.1 MLP—固定窗口的映射
+##### 1）绝对位置编码：在输入层直接相加
 
-对于固定窗口大小为 `T` 的输入序列 `X = [x_1, x_2, ..., x_T] ∈ R^{T × d}`，MLP 先将窗口展平为 `vec(X) ∈ R^{Td}`，再统一映射：
-
-$$
-y = \sigma(W \cdot \mathrm{vec}(X) + b)
-$$
-
-**关键缺陷：**
-
-- 只能处理**固定长度**的输入窗口，无法适应变长序列。
-- 各位置**独立处理**，完全丢失词序信息。
-- 窗口外的上下文被截断，**无法建模长距离依赖**。
-
-#### 1.2 RNN—状态递归
-
-`h_t` 表示当前时间步的隐状态，`x_t` 表示当前输入：
+Token `x_m` 先查词向量，再加上位置 `m` 的向量：
 
 $$
-h_t = \tanh(W_h h_{t-1} + W_x x_t + b)
+h_m = E(x_m) + P_m
 $$
 
-$$
-y_t = W_y h_t + b_y
-$$
+`P_m` 可以是固定的 Sinusoidal，也可以是一张可学习的位置表。直白说，模型输入处已经知道“我是第 17 个 Token”。
 
-**优点：**
+- **表征能力**：绝对位置很直接，例如开头、结尾、某个固定槽位；但“相距 3 个 Token”要由 Attention 后续从 `P_m` 和 `P_n` 中推导。
+- **外推能力**：可学习位置表只有训练过的位置；Sinusoidal 虽可计算更长位置，但训练中未见过这些相位组合，效果未必稳定。因此绝对位置编码通常不擅长可靠的长上下文外推。
 
-* 引入**递归状态**，天然支持**变长序列**。
-* 隐状态沿时间步传递，保持**顺序敏感性**。
-* 理论上可依赖**任意远的过去信息**.
+##### 2）相对位置编码：在 QK 打分时加距离偏置
 
-**缺点：**
-
-- **串行计算**：每个时间步依赖前一时刻的隐状态，无法并行训练，处理长序列慢。
-- **长距离遗忘**：全局信息传播依赖于递归过程，远距离信息会衰减，难以捕获全局依赖。
-
-#### 1.3 Transformer—全局注意力，完全并行
-
-Transformer的端到端模型：
-
-- **Token Embedding**：从可学习表中查出每个 Token 的向量：
+不改输入向量，而是在位置 `m` 查询位置 `n` 时，直接向注意力分数加入与距离 `m-n` 有关的偏置：
 
 $$
-\mathbf{X}_{\mathrm{token}} = \mathrm{Lookup}(E, \mathrm{tokens}), \quad E \in \mathbb{R}^{V \times d_{\mathrm{model}}}
+s_{m,n} = \frac{q_m^T k_n}{\sqrt{d}} + b_{m-n}
 $$
 
-- **位置编码**：把顺序信息注入 Token 表示：
+其中 `b_{m-n}` 可是一张相对距离表、按距离分桶的 bias，或 ALiBi 这类随距离线性衰减的项。
 
-$$
-\mathbf{X} = \mathbf{X}_{\mathrm{token}} + \mathbf{P}, \quad \mathbf{P} \in \mathbb{R}^{T \times d_{\mathrm{model}}}
-$$
-- **Self-Attention**：让每个 Token 从允许访问的其他 Token 中聚合信息；
-- **Multi-Head Attention**：多个头分别学习不同关系，拼接后再做一次线性映射；
+- **表征能力**：最直接地表达“前面第 3 个”“后面第 10 个”，天然适合局部依赖、距离衰减和方向关系；但它不强调“这是全局第 17 位”。
+- **外推能力**：取决于 bias 形式。有限距离表或 bucket 超出训练范围后通常会截断/复用；ALiBi 这类连续线性 bias 更易拉长，但仍要看训练分布与任务质量。
 
-- **前馈层（FFN）**：`FFN(x) = max(0, xW_1 + b_1)W_2 + b_2` 或写作 `FFN(x) = ReLU(xW_1 + b_1)W_2 + b_2`
+##### 3）RoPE：旋转 Q、K，让内积自动变成相对位置关系
 
-### 2 Transformer 的架构组成
-
-我们把 Transformer 从架构上分为三层
-
-#### 2.1 输入表征层
-
-**目标**：把离散的 token 变成模型能处理的连续向量，并注入位置信息。
-
-##### ① Token Embedding
-
-- **原理**：每个 token 对应一个可学习的向量，形状为 `[vocab_size, d_model]`。
-- **输入**：`input_ids`，形状 `[batch_size, seq_len]`（比如 `[2, 512]`）。
-- **输出**：`[2, 512, d_model]`（`d_model` 通常取 512、768、1024 等）。
-
-##### ② Positional Encoding
-
-**Why**：Self-Attention 本身是**置换等变的**——如果把输入序列打乱，Attention 输出也会对应打乱，但它**没有内置的顺序概念**。所以我们需要显式注入位置信息。
-
-**三种主流方式**：
-
-1. **Sinusoidal（正弦/余弦）编码**（原始 Transformer）
-
-不同维度使用不同频率的正弦和余弦表示位置：低频维度描述大范围位置，高频维度区分邻近位置。无需背具体公式。
-
-- 优点：可以外推到比训练时更长的序列；无需额外参数。
-- **Why 用 sin/cos？** 使得对于任意偏移量 `k`，`PE_{pos+k}` 可以表示为 `PE_{pos}` 的线性变换，便于模型学习相对位置。
-
-2. **可学习位置编码**（BERT、GPT 等常用）
-
-- 直接初始化一个 `[max_seq_len, d_model]` 的参数矩阵，随网络一起训练。
-- 优点：更灵活，可以适应任务；缺点：最大长度固定，不能外推。
-
-**输出**：两种编码都与 token embedding **相加**，形状不变 `[batch, seq, d_model]`。
-
-3. **RoPE（旋转位置编码）**
-
-- 不是将位置向量加到词向量上，而是按二维一组旋转 **Query 和 Key**。位置越靠后，旋转角度越大；Q、K 内积因此自然包含相对距离 `m-n`。
-
-实际计算中不显式构造矩阵，而是利用复数乘法或按维度公式：
+RoPE 不在输入表征上加位置向量，而是在每个 Attention Head 中，把 Q、K 的相邻两个分量看成一个二维平面。第 `i` 对分量有频率 `\theta_i`，位置 `m` 的 Q/K 旋转角度为 `m\theta_i`：
 
 $$
 \begin{aligned}
-q'_0 &= q_0 \cos m\theta_i - q_1 \sin m\theta_i \\
-q'_1 &= q_1 \cos m\theta_i + q_0 \sin m\theta_i
+q'_{m,2i} &= q_{m,2i}\cos(m\theta_i) - q_{m,2i+1}\sin(m\theta_i) \\
+q'_{m,2i+1} &= q_{m,2i}\sin(m\theta_i) + q_{m,2i+1}\cos(m\theta_i)
 \end{aligned}
 $$
 
-**代码片段（复数实现）**：
-
-```python
-def precompute_freqs_cis(dim, seq_len, theta=10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim//2] / dim))
-    t = torch.arange(seq_len)
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)
-
-def apply_rotary_emb(x, freqs_cis):
-    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    x_rotated = x_complex * freqs_cis[:, None, :]
-    return torch.view_as_real(x_rotated).flatten(3).type_as(x)
-```
-
-- **意义**
-  - **相对位置建模**：内积结果 `f_q(q,m) · f_k(k,n)` 只依赖于 `m-n`。
-  - **长序列外推友好**：可通过 Position Interpolation 等方法扩展上下文窗口。
-  - **无额外参数**：旋转是确定的。
-
-**常见问题**
-
-1. **RoPE 与绝对位置编码（如 Sinusoidal）本质区别？**
-   → 绝对位置编码是在输入层加位置向量，RoPE 直接修改 Q/K，使注意力分数隐含相对位置。
-2. **如何用 RoPE 实现 4k → 32k 上下文外推？**
-   → 位置插值（PI）：将位置索引从 `m` 缩小为 `m × (L_{train} / L_{test})`；NTK-aware scaling：调整 base 值。
-3. **手写 RoPE 旋转公式（对一对维度）** → 见上方公式。
-
-
-#### 2.2 注意力层
-
-这是 Transformer 的“核心引擎”，也是理解 Transformer 的核心部分。
-
-##### ① 缩放点积注意力（Scaled Dot-Product Attention）
-
-**公式**：
+K 做同样的旋转。每个 `q'_m`、`k'_n` 都带有其各自的**绝对位置**；但计算内积时，两个旋转的共同部分抵消：
 
 $$
-\mathrm{Attention}(Q, K, V) = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
+(R_m q_m)^T(R_n k_n) = q_m^T R_{n-m}k_n
 $$
 
-- **Q, K, V** 由同一个输入 `X` 通过三个不同的线性变换得到。
-- **Shape**：假设输入 `X` 为 `[B, S, D]`，线性变换后依然 `[B, S, D]`。
-  为了多头，后面会切分，但这里先看单头。
+所以 Attention 打分中位置相关的部分只取决于相对距离 `n-m`。这就是“RoPE 同时把绝对位置写进 Q/K，而注意力关系天然按相对距离比较”的含义。
 
-**计算过程**：
+- **表征能力**：每个频率对应不同尺度的距离变化，高频分量区分近距离，低频分量覆盖远距离；相比单纯加位置向量，QK 计算更容易利用相对位移。
+- **外推能力**：RoPE 是确定性旋转、没有位置表，因此可以计算任意 `m`；但这不代表模型能无损泛化到任意长度。训练窗口外会遇到未见过的旋转角度与相位分布，仍会退化。实践中常用 Position Interpolation、NTK-aware scaling、YaRN 等缩放策略，把更长的位置映射回更接近训练分布的频率范围。
 
-1. `QK^T`：`[B, S, D]` × `[B, D, S]` → `[B, S, S]`，表示每个位置对其他所有位置的“相似度”。
-2. 除以 `sqrt(d_k)`（其中 `d_k = D / H`，H 为头数）。
-   - **Why？** 假设 `q, k` 的每个元素均值为 0，方差为 1，那么 `q · k` 的方差就是 `d_k`。当 `d_k` 较大时，点积结果会非常大，导致 softmax 进入饱和区（梯度极小）。除以 `sqrt(d_k)` 使方差回到 1，保持梯度稳定。
-3. softmax 按行（最后一个维度）归一化，得到注意力权重。
-4. 乘以 `V`：`[B, S, S]` × `[B, S, D]` → `[B, S, D]`，加权聚合信息。
+**总结**：绝对编码最容易表达“我在哪”；相对 bias 最直接表达“我们相隔多远”；RoPE 把位置作为 Q/K 的旋转相位注入，使 Attention 内积天然感知相对位移。长上下文外推上，三者都受训练长度限制；RoPE 因连续、无表的频率结构和成熟缩放方法，通常是现代 Decoder LLM 的主流选择，但不能把“可计算更长位置”误说成“天然无限外推”。
 
-**代码（单头）**：
-
-```python
-def scaled_dot_product_attention(q, k, v, mask=None):
-    # q, k, v: [batch, seq_len, d_k]
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)  # [B, S, S]
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    attn_weights = torch.softmax(scores, dim=-1)
-    output = torch.matmul(attn_weights, v)  # [B, S, d_k]
-    return output, attn_weights
-```
-
-##### ② 多头注意力（Multi-Head Attention, MHA）
-
-**Why 多头？**
-单头注意力只能学到一种“关系”。多头让模型在不同的子空间里分别计算注意力，从而捕捉多种类型的关系（比如语法、语义、共现等）。类似于 CNN 中用多个卷积核。
-
-**实现步骤**：
-
-1. 线性变换得到 `Q, K, V`，形状 `[B, S, D]`。
-2. 将最后一维切分成 `H` 个头：`[B, S, H, D_k]`（`D = H × D_k`）。
-3. 交换维度，变成 `[B, H, S, D_k]`，方便并行计算。
-4. 对每个头独立做缩放点积注意力，得到 `[B, H, S, D_k]`。
-5. 交换回 `[B, S, H, D_k]`，合并成 `[B, S, D]`。
-6. 最后一个线性投影，输出 `[B, S, D]`。
-
-**伪代码**：
-
-```python
-def multi_head_attention(x, num_heads, d_model):
-    batch, seq, _ = x.shape
-    d_k = d_model // num_heads
-
-    # 线性变换
-    q = nn.Linear(d_model, d_model)(x)  # [B, S, D]
-    k = nn.Linear(d_model, d_model)(x)
-    v = nn.Linear(d_model, d_model)(x)
-
-    # 切头
-    q = q.view(batch, seq, num_heads, d_k).transpose(1, 2)  # [B, H, S, D_k]
-    k = k.view(batch, seq, num_heads, d_k).transpose(1, 2)
-    v = v.view(batch, seq, num_heads, d_k).transpose(1, 2)
-
-    # 缩放点积注意力
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)  # [B, H, S, S]
-    attn = torch.softmax(scores, dim=-1)
-    out = torch.matmul(attn, v)  # [B, H, S, D_k]
-
-    # 合并头
-    out = out.transpose(1, 2).contiguous().view(batch, seq, d_model)  # [B, S, D]
-    out = nn.Linear(d_model, d_model)(out)  # 最终投影
-    return out
-```
-
-##### ③ 掩码（Mask）
-
-**两种掩码**：
-
-- **Padding Mask**：对输入中的填充位置（如 `[PAD]`）进行屏蔽，防止模型关注它们。
-  方法：在 softmax 之前，将对应位置设为 `-inf`（或一个极小的负数），使 softmax 后的权重接近 0。
-
-- **Causal Mask（因果掩码）**：在 Decoder 中，保证位置 `i` 只能看到位置 `j ≤ i` 的 token，防止“看到未来”。
-  方法：构造一个上三角矩阵（不含对角线），对每个 `(i, j)` 其中 `j > i` 的位置设为 `-inf`。
-
-**Shape**：通常 mask 是 `[B, 1, 1, S]` 或 `[1, 1, S, S]`，通过广播机制与 `[B, H, S, S]` 对齐。
-
-#### 2.3 结构层
-
-##### ① 前馈网络（FFN）
-
-$$
-\mathrm{FFN}(x) = \mathrm{ReLU}(xW_1 + b_1)W_2 + b_2
-$$
-
-- `W_1` 的形状：`[d_model, d_ff]`，通常 `d_{ff} = 4 × d_{model}`。
-- `W_2` 的形状：`[d_ff, d_model]`。
-- **Why 需要 FFN？**
-  Attention 负责在**不同 token 之间**交换信息（线性加权），FFN 负责在**每个 token 内部**做非线性变换，提升模型表达能力。两者交替，形成了 Transformer 的“通信-计算”结构。
-
-**现代变体**（如 LLaMA 使用 SwiGLU）：一条分支产生内容，另一条分支产生门控，两者逐元素相乘。它通常比 ReLU FFN 表达能力更强，但参数与计算略多。
-
-##### ② 残差连接 + 层归一化（Residual + LayerNorm）
-
-$$
-\mathrm{Output} = \mathrm{LayerNorm}(x + \mathrm{Sublayer}(x))
-$$
-
-这是原始 Transformer 的 Post-Norm；现代大模型更常用 `x + Sublayer(LayerNorm(x))` 的 Pre-Norm。
-
-- **Why 残差？**
-  解决深层网络梯度消失问题，保证梯度能直接从损失流回浅层。
-
-- **Why LayerNorm，而不是 BatchNorm？**
-  - LN 对每个样本的**特征维度**做归一化，不依赖于 batch 大小，对变长序列友好。
-  - BN 依赖 batch 统计量，且对变长序列（不同样本长度不一）处理复杂。
-  - 在 Transformer 中，LN 能使训练更稳定。
-
-- **Pre-Norm vs Post-Norm**：
-  - **Post-Norm**（原始）：`LN(x + Sublayer(x))`。收敛慢，需要 warmup，但理论表达能力强。
-  - **Pre-Norm**（主流）：`x + Sublayer(LN(x))`。梯度流更顺畅，无需 warmup，训练稳定，但可能略低于 Post-Norm 的理论上限。几乎所有大模型（GPT、LLaMA）都用 Pre-Norm。
-
-##### ③ 最后的 Softmax
-
-在解码器输出后，通过一个线性层（`[d_model, vocab_size]`）将隐状态映射为 logits，再 softmax 得到概率分布，用于预测下一个 token。
-
-### 3 Transformer三种架构
-
-| 架构                | 代表模型                 | 核心结构                      | 注意力掩码                                       | 训练任务                                | 典型应用                           |
-| ------------------- | ------------------------ | ----------------------------- | ------------------------------------------------ | --------------------------------------- | ---------------------------------- |
-| **Encoder-Only**    | BERT, RoBERTa            | 堆叠 Encoder 层               | 双向（无掩码）                                   | MLM（掩码语言模型）+ NSP（可选）        | 理解类任务：分类、实体识别、相似度 |
-| **Decoder-Only**    | GPT 系列, LLaMA, Mistral | 堆叠 Decoder 层（带因果掩码） | 因果（只能看左边）                               | 自回归语言建模（Next Token Prediction） | 生成类任务：对话、写作、代码、推理 |
-| **Encoder-Decoder** | T5, BART, M2M100         | Encoder + Decoder             | Encoder：双向<br>Decoder：因果 + Cross-Attention | 去噪自编码（Span Corruption）或翻译     | 序列到序列：翻译、摘要、结构化转换 |
-
-#### 3.1 深入对比与 Why
-
-##### ① Encoder-Only（以 BERT 为例）
-
-- **结构**：多层双向 Attention。
-- **为什么双向？**
-  理解任务（如情感分类）需要同时看到上下文，才能准确判断语义。比如 “not good” 中的否定需要结合后面的词才能理解。
-- **训练任务**：**MLM**（Masked Language Model）——随机 mask 掉 15% 的 token，让模型预测。迫使模型学会利用双向上下文。
-- **局限**：无法做生成（因为生成需要从左到右自回归）。
-
-##### ② Decoder-Only（以 GPT 为例）
-
-- **结构**：多层因果 Attention（上三角 mask）。
-- **为什么因果？**
-  生成文本时，只能根据已经生成的 token 预测下一个，不能“偷看”未来，符合自回归生成的逻辑。
-- **训练任务**：自回归语言建模，即给定前文预测下一个 token。
-- **为什么现在主流是大 Decoder-Only？**
-  1. **通用性**：生成任务天然涵盖理解任务（通过 prompt 可以要求模型做分类、问答等）。
-  2. **训练效率**：相比 Encoder-Decoder，参数利用率更高（没有额外 Encoder）。
-  3. **涌现能力**：大规模的 Decoder-Only 模型（如 GPT-3、LLaMA）在上下文学习（In-context Learning）、思维链（CoT）等方面表现出色。
-
-##### ③ Encoder-Decoder（以 T5 为例）
-
-- **结构**：Encoder 对输入做双向编码，Decoder 通过 Cross-Attention 对齐 Encoder 输出，自回归生成。
-- **为什么需要这种结构？**
-  当输入和输出**长度差异大**或**结构不同**时（比如翻译：中文->英文，摘要：长文->短摘要），Encoder 专门负责理解源文本，Decoder 专门负责生成目标文本，中间用 Cross-Attention 进行对齐，比单一的 Decoder 更自然。
-- **训练任务**：T5 采用 **Span Corruption** —— 将输入中若干连续 token 替换为一个哨兵 token，Decoder 需要恢复这些被 mask 的 span。这种训练方式结合了双向理解和自回归生成。
-
-#### 3.2 关于 Decoder-Only 成为主流的深入思考
-
-进一步的问题是：“既然 Encoder-Decoder 对 Seq2Seq 更自然，为什么大模型几乎都是 Decoder-Only？”
-
-- **回答思路**：
-  1. **规模效应**：在相同参数规模下，Decoder-Only 的 FLOPs 更低（因为不需要 Cross-Attention 的双向计算？不对，其实 Decoder-Only 也有双向？）—— 更准确地说，Decoder-Only 的**参数利用效率高**，所有参数都用于生成任务，而 Encoder-Decoder 中 Encoder 参数只用于理解源文本，生成时全靠 Decoder，参数利用率低。
-  2. **指令微调与通用性**：Decoder-Only 通过 prompt 可以完成各种任务（如 “请分类：...” ），一个模型通吃。而 Encoder-Decoder 往往需要为不同任务调整结构。
-  3. **涌现能力**：大规模 Decoder-Only 模型在上下文学习上表现出更强的涌现能力，可能与因果掩码带来的“顺序推理”特性有关。
-
-**补充**：目前也有一些混合架构（如 Encoder-Decoder 的大型模型，例如 T5-11B），但主流开源模型（LLaMA, Mistral, Qwen）和闭源模型（GPT-4）都选择 Decoder-Only。
-
-### 4 MoE：稀疏激活与路由
-
-MoE 的一句话是：**总参数可以很大，但每个 Token 只激活少量 Expert。** Router 为每个 Token 选择 Top-K 专家并加权汇总，因此用接近 Dense 模型的单 Token 计算量换取更大的参数容量。
-
-面试时优先讲清三点：
-
-- **为什么省算力**：只计算 Top-K Expert，不跑全部 Expert；
-- **核心风险**：少数 Expert 被持续选中会形成路由坍塌与负载不均；
-- **工程代价**：需要负载均衡、容量控制和跨卡 All-to-All 通信，训练/推理并非“免费扩大参数”。
-
-#### 4.1 MoE 的架构细节
-
-##### Token Choice
-
-这是最常见的方式，例如 Switch Transformer、Mixtral、DeepSeek-MoE 都采用 Token Choice。
-
-**原理**：每个 token 独立地选择最合适的 Top-K 个专家。Router 对每个 token 输出一个对所有专家的概率分布，然后每个 token 挑选概率最高的 K 个专家，将自身的表示发送给这些专家，专家的输出按路由概率加权求和。
-
-**公式**：
-对于 token `x`，Router 输出 logits `h(x) = W_g x`（`W_g ∈ R^{E × d}`），再经 softmax 得到路由概率 `p`。选择 Top-K 索引集合 `T_set` 后，令 `g_i` 表示第 `i` 个 Expert，最终输出：
-
-$$
-y = \sum_{i \in \mathcal{T}} p_i g_i(x)
-$$
-
-**特点**：
-
-- 每个 token 的计算量固定（K 个专家）。
-- 不同 token 可能选择不同的专家，专家负载可能不均衡（有的专家被很多 token 选择，有的很少）。
-- 需要辅助损失（负载均衡损失）来鼓励均匀分配。
-
-##### Expert Choice
-
-这是一种较少见但有趣的方式，由例如 "Mixture-of-Experts with Expert Choice" 论文提出。
-
-**原理**：每个专家选择它要处理的 token，而不是 token 选择专家。具体来说，对所有 token 的路由分数，每个专家挑选分数最高的 Top-K 个 token（或者按容量选择）。专家输出后，再根据路由分数加权聚合回每个 token。
-
-设 batch 中有 `T` 个 Token，每个 Expert 固定选择得分最高的 `C=γT/E` 个 Token，处理后再按路由分数聚合回原 Token。这里的重点是：**容量从 Expert 视角预先固定，所以负载天然更均衡。**
-
-**特点**：
-
-- 负载天然均衡（每个专家处理固定数量的 token），强制均匀分布。
-- 但每个专家处理的 token 数量固定，可能造成信息损失（如果某专家对所有 token 分数都很低，仍需强制选择一些 token）。
-- 实现复杂度高，推理时难以动态适配。
-
-**常见问题**：
-
-- Token Choice 为什么需要辅助损失？Expert Choice 如何避免负载不均衡？
-- 在实际大模型中，哪种更常用？为什么？（Token Choice 更灵活，实现简单，配合辅助损失效果好。）
-
-
-#### 4.2 路由选择
-
-Router的本质是一个线性层 `W_g ∈ R^{E × d}`，输入 token 的隐向量 `x ∈ R^d`，输出 logits `z = W_g x`（维度 `E`，专家数量）。然后经过 softmax 得到概率分布。
-
-**关点**：
-
-- **噪声注入**（训练时）：在 Router logits 上加入可调节噪声，避免训练早期总是命中少数 Expert；噪声通常随训练逐渐减弱。
-
-- **温度系数**：可以引入温度 `T` 来平滑或锐化分布。`T<1` 使分布更尖锐（偏向最大专家），`T>1` 更平滑。通常 `T=1`。
-
-**常见问题**：
-
-- 为什么需要在路由 logits 中加噪声？（防止 Router 早期崩溃到单一专家，促进探索）
-- 路由 logits 的梯度如何传播？（通过 softmax 和 Top-K 选择，但 Top-K 操作本身不可微，通常采用 straight-through estimator 或使用 soft Top-K）
-
-在 Token Choice 中，每个 token 不是选择所有专家，而是只选概率最高的 K 个专家（K 通常为 1 或 2）。
-
-**为什么 K=1 或 2？**
-
-- **K=1**：Switch Transformer 使用。每个 token 只由一个专家处理，计算量最小，但可能损失表达能力（单一专家可能无法处理复杂模式）。
-- **K=2**：Mixtral、DeepSeek-MoE 使用。平衡了计算量和表达能力，且可以缓解负载均衡（因为 token 可以同时选两个专家，更容易均匀分布）。
-
-**Top-K 的软硬选择**：
-
-- **硬 Top-K**：直接选择概率最高的 K 个，其他专家输出为 0。这种方式不可微，但通过梯度估计（如将选择的专家的梯度回传，未选的不回传）仍然可以训练。
-- **软 Top-K**：使用连续的近似，如对概率分布做 top-k 平滑（将非 Top-K 的概率置 0，再归一化），仍然可微但计算稍复杂。
-
-**容量因子（Capacity Factor）**：
-为了控制每个专家处理的 token 数量，常引入容量因子。若 batch 中有 `T` 个 token，每个专家容量可写为 `C=γ T/E`。如果某个专家被分配的 token 超过容量，超出的 token 会被丢弃（或通过残差连接绕过专家）。容量因子 `γ` 通常设为 1.0~1.5，避免 token 被丢弃过多。
-
-**常见问题**：
-
-- 为什么 Top-2 比 Top-1 更好？（降低负载不均衡，提高模型容量）
-- 容量因子过小或过大会有什么影响？（过小导致 token 被丢弃，信息损失；过大导致负载不均衡和计算浪费）
-- 如何解决 Token 被丢弃的问题？（使用更大的容量因子，或使用 Expert Choice）
-
-#### 4.3 MoE 的路由坍塌
-
-**路由坍塌（Routing Collapse）** 是指 Router 将所有 token 都分配给少数几个专家，导致其他专家几乎不被训练，模型退化为一个小型 Dense 模型，失去了 MoE 的优势。这是 MoE 训练中最常见的问题。
-
-导致坍塌的原因：
-
-- 早期训练时，Router 随机初始化，某个专家偶然获得稍高的分数，该专家得到更多 token → 该专家梯度更新更多 → 它变得更擅长处理更多 token → 正反馈循环，其他专家逐渐被“饿死”。
-- 缺乏足够的探索，Router 过早陷入局部最优。
-
-解决方案：
-
-##### 辅助损失（Auxiliary Loss）
-
-这是最常用的方法，在训练目标中加入一个辅助损失，惩罚负载不均衡。常见的两种形式：
-
-**a) Importance-based Loss（Switch Transformer）**：同时观察 Expert 实际接收的 Token 占比，以及 Router 分给它的平均概率；某个 Expert 在两项指标上都过高，就增加惩罚。
-
-**b) Load-based Loss（GShard）**：直接惩罚各 Expert 实际负载偏离平均值 `T/E` 的程度，更直观地约束负载均衡。
-
-**常见问题**：
-
-- 辅助损失如何与主损失（如语言建模损失）平衡？系数 `α` 如何选择？（通常很小，如 0.01，否则会干扰主任务）
-- 辅助损失是否会影响模型性能？（适当使用可提升性能，因为负载均衡本身也有利于充分利用专家容量）
-
-##### 熵正则化（Entropy Regularization）
-
-**原理**：通过提高 Router 分布的熵，避免概率过早集中到少数 Expert，间接提升专家利用多样性。这里理解“分布越尖锐，熵越低”即可。
-
-**与辅助损失的区别**：
-
-- 熵正则化作用于每个 token 的概率分布，鼓励 token 级别的均匀性。
-- 辅助损失作用于全局统计，鼓励专家级别的负载均匀。
-- 两者可以同时使用，相辅相成。
-
-**常见问题**：
-
-- 熵正则化为什么能缓解路由坍塌？（防止 Router 输出尖锐分布，迫使每个 token 考虑多个专家）
-- 熵正则化会不会导致每个 token 选择的专家过于分散，降低模型能力？（通过调节 `α` 可以平衡）
-
-##### 硬约束（Hard Constraints）
-
-不通过损失惩罚，而是直接对路由施加硬性限制，确保负载均衡。
-
-**a) Expert Capacity 限制**
-每个专家设置最大 token 容量（如 `C=ceil(γ T/E)`）。当某个专家被分配的 token 达到容量后，后续选择该专家的 token 会被强制重定向到其他专家（或直接丢弃/绕过）。
-
-**实现**：在训练时，记录每个专家已处理的 token 数量，当超过容量时，将该 token 的该专家分数设为 `-∞`，使其不再被选中。
-
-**b) 强制均匀采样（Stochastic Routing）**
-在训练初期，以一定概率随机分配专家（无视 Router 分数），强制每个专家都有机会训练。随着训练进行，逐渐退火到完全由 Router 决定。
-
-**常见问题**：
-
-- 硬约束与软约束（辅助损失）的优缺点比较？硬约束保证绝对均衡，但可能丢弃 token 损失信息；软约束更平滑，但可能无法完全均衡。
-- 容量因子如何设置？过小导致大量 token 被丢弃，过大则失去均衡作用。通常设为 1.0~1.5。=
-
-##### 综合对比
-
-| 方法         | 原理                   | 优点                       | 缺点                         |
-| ------------ | ---------------------- | -------------------------- | ---------------------------- |
-| **辅助损失** | 在损失中加惩罚项       | 平滑，不影响 token 分配    | 需要调整系数，可能干扰主任务 |
-| **熵正则化** | 鼓励 token 级分布均匀  | 简单，防止 Router 过早尖锐 | 可能降低专家专业化程度       |
-| **硬约束**   | 强制容量限制或随机分配 | 确保绝对均衡，直接有效     | 可能丢弃 token，实现复杂     |
-
-在实际大模型（如 Mixtral、DeepSeek-MoE）中，通常**组合使用**多种方法：主要依赖辅助损失（负载均衡损失），配合熵正则化，同时设置合理的容量因子（硬约束），以保证训练稳定性和专家利用率。
-
-### 5 多模态大模型：从图像到语言 Token
-
-![多模态大模型：图像与文本如何进入 LLM](figures/multimodal-llm-flow.png)
-
-文本模型接收离散 Token ID，而图像本质上是像素矩阵。多模态模型首先要解决的不是“让 LLM 看图”，而是三个更具体的问题：
-
-1. 如何把大小不一的图像转换成一串视觉 Token；
-2. 如何把视觉特征对齐到 LLM 的表示空间；
-3. 如何让文本 Token 在生成过程中读取并引用视觉信息。
-
-先看一条最常见的视觉语言模型链路：
-
-```text
-Image → Patchify → Vision Encoder → Projector / Resampler
-      → Visual Tokens + Text Tokens → LLM → Text / Tool Call / JSON
-```
-
-#### 5.1 第一步：把图像切成 Patch
-
-ViT 把图像切成固定大小的 Patch，再把每个 Patch 展平并线性投影。若输入尺寸为 `H× W`，Patch 尺寸为 `P× P`，视觉 Token 数为：
-
-$$
-N_{vision}=\frac{H}{P}\times\frac{W}{P}
-$$
-
-例如 `448×448` 图像使用 `14×14` Patch，会产生 `32×32=1024` 个 Patch Token。长宽同时翻倍时，Token 数变为 4 倍；视觉细节增加的同时，LLM 的 Context、Prefill 和 KV Cache 压力也随之上升。
-
-Patch Embedding 本质上可用一个步长等于 Patch 大小的卷积实现：
-
-```python
-class PatchEmbedding(nn.Module):
-    def __init__(self, in_channels=3, hidden_size=1024, patch_size=14):
-        super().__init__()
-        self.proj = nn.Conv2d(
-            in_channels, hidden_size,
-            kernel_size=patch_size, stride=patch_size,
-        )
-
-    def forward(self, image):              # [B, 3, H, W]
-        feature = self.proj(image)          # [B, D, H/P, W/P]
-        return feature.flatten(2).transpose(1, 2)  # [B, N, D]
-```
-
-Patch 越小，局部细节越充分，但 Token 数和计算成本越高；Patch 越大则更便宜，但 OCR、小物体和细粒度定位更容易丢失信息。
-
-#### 5.2 第二步：Vision Encoder 提取视觉语义
-
-Patch Embedding 只完成像素分块，还不包含高级语义。Vision Encoder 通常是 ViT：为 Patch Token 加入二维位置信息，再经过多层 Self-Attention 和 FFN，使一个局部 Patch 能融合整张图的上下文。
-
-二维位置信息尤其重要：文字“猫在桌子下面”不仅依赖物体是什么，还依赖它们的相对位置。常见方案包括绝对位置 Embedding、二维 RoPE、相对位置 Bias。输入分辨率变化后，固定位置 Embedding 还需要插值；处理不当会导致高分辨率或非训练宽高比下能力下降。
-
-Vision Encoder 的输出形状通常为 `[B, N_vision, D_v]`。
-
-它已经包含视觉语义，但维度 `D_v`、数值分布和 Token 数量通常都与 LLM 不匹配，因此不能简单地把它当作文本 Embedding 使用。
-
-#### 5.3 第三步：Projector 对齐视觉与语言空间
-
-Projector 将视觉特征从 `D_v` 映射到 LLM hidden size `D_l`，输出形状为 `[B, N', D_l]`；其中 `N'` 是否小于原视觉 Token 数取决于是否同时做了压缩或重采样。
-
-常见方案的区别是“保留多少视觉 Token”：
-
-| 方案 | 做法 | 特点 |
-|---|---|---|
-| Linear / MLP | 每个 Patch 独立映射到 LLM 维度 | 简单、细节保留多，但视觉 Token 较长 |
-| Q-Former / Resampler | 用固定数量的 Query 从全部视觉特征中抽取信息 | Token 数稳定，但压缩可能损失 OCR 和局部细节 |
-| Token Merger | 合并相邻或相似 Token | 在细节与计算之间动态折中 |
-
-最简单的 Projector 只是一个 MLP：
-
-```python
-projector = nn.Sequential(
-    nn.Linear(vision_dim, llm_dim),
-    nn.GELU(),
-    nn.Linear(llm_dim, llm_dim),
-)
-visual_tokens = projector(vision_features)
-```
-
-Projector 不是单纯“修改维度”。训练会让它学习：哪些视觉模式应落到 LLM 已有的语义空间，以及视觉 Token 应以怎样的分布进入语言模型。
-
-#### 5.4 第四步：视觉 Token 如何进入 LLM
-
-主流融合方式可以分成两类。
-
-**Token 拼接式（Decoder-only）**：把 `<image>` 占位符替换为视觉 Embedding，再与文本 Embedding 一起送入 LLM：
-
-```text
-<BOS> User: [IMG_START] v1 v2 ... vN [IMG_END] 描述这张图
-Assistant: ...
-```
-
-```python
-text_embeds = llm.embed_tokens(input_ids)
-inputs_embeds = replace_image_placeholders(text_embeds, visual_tokens)
-logits = llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
-```
-
-这类架构复用原有 Decoder-only LLM，工程简单；代价是视觉 Token 直接占用 Context，且所有视觉信息都参与 LLM Self-Attention。
-
-**Cross-Attention 式**：文本仍走 LLM 主干，在部分层增加 Cross-Attention，让文本 Query 读取视觉 K/V。它不必把全部视觉 Token 塞进文本序列，但需要修改 LLM 结构和训练方式。
-
-无论采用哪种方式，模型最终仍是自回归预测下一个文本 Token。视觉信息改变的是每一步预测所能读取的条件，而不是输出头的基本形式。
-
-#### 5.5 分辨率、宽高比与多图输入
-
-固定 Resize 会把所有图像拉成同一尺寸，Batch 简单，但可能造成形变或细节丢失。常见改进包括：
-
-- **Dynamic Resolution**：保留宽高比，将图像调整到若干允许尺寸，并动态产生视觉 Token；
-- **Tiling / Any-resolution**：保留一张低分辨率全局图，同时把原图切成多个高分辨率局部块；
-- **Thumbnail + Crops**：全局缩略图负责整体关系，局部 Crop 负责 OCR 和细节。
-
-Tiling 的难点是局部块数量可能暴涨，而且模型必须知道每块在原图中的空间位置。多图输入还要加入图像边界和序号，防止模型把图 1 的证据错误归到图 2。
-
-#### 5.6 多模态模型如何训练出来
-
-多模态能力通常不是一步 SFT 得到，而是逐阶段对齐：
-
-1. **Feature Alignment**：冻结 Vision Encoder 与 LLM，只训练 Projector，用图文对让视觉特征进入语言空间；
-2. **Multimodal Pretraining**：使用大规模 Caption、OCR、文档和交错图文数据，学习视觉概念与语言之间的对应；
-3. **Multimodal SFT**：训练图像问答、图表理解、Grounding、多轮对话和结构化输出；
-4. **Preference Alignment**：通过 DPO/RLHF 等方法改善视觉幻觉、拒答、安全和回答风格。
-
-第一阶段只解决“看见的特征能否被 LLM 接收”；SFT 才进一步解决“是否按照用户指令使用这些信息”。如果 Vision Encoder 没有提取出小字或目标边界，只训练语言侧 LoRA 也无法凭空恢复这些信息。
-
-#### 5.7 训练目标与 Label Mask
-
-最常见的训练目标仍是文本的 Next Token Prediction。图像占位符、视觉 Token、System 和 User 内容用于提供条件，通常只对 Assistant 回答计算语言模型损失：
-
-```text
-图像 Token：mask    用户问题：mask    Assistant 答案：计算 loss
-```
-
-若任务包含 Bounding Box、Point、OCR 坐标或 Tool Call，可以把位置离散成特殊 Token 继续使用语言模型损失，也可以增加单独的检测/对齐损失。前者协议统一，后者通常对连续空间定位更直接。
-
-#### 5.8 推理成本与常见瓶颈
-
-一次多模态请求通常包含两段 Prefill：先运行 Vision Encoder，再让 LLM 消化视觉 Token 与文本 Token。主要瓶颈包括：
-
-- 高分辨率或多图导致视觉 Token 数过多，TTFT 明显增长；
-- 不同图像 Token 数差异大，Batch 中 padding 浪费严重；
-- Vision Encoder 与 LLM 的计算形态不同，资源利用不均；
-- 图片预处理、下载和解码可能成为 GPU 之外的延迟来源；
-- 视觉特征缓存可以避免重复编码，但必须绑定图片内容、预处理配置和模型版本。
-
-因此，多模态服务不能只按文本 Token 限流，通常要将图像数量、像素数或估算后的视觉 Token 一起计入 Admission Control。
-
-**常见问题**
-
-1. **Projector 与 Vision Encoder 分别解决什么问题？**
-   Vision Encoder 从像素提取语义；Projector 将视觉语义映射或压缩到 LLM 能消费的表示空间。
-2. **为什么分辨率翻倍后成本可能接近四倍？**
-   长宽同时翻倍时 Patch 数变为四倍，并进一步增加 LLM Prefill 的序列长度。
-3. **Token 拼接与 Cross-Attention 如何选择？**
-   拼接式结构简单、便于复用现有 LLM；Cross-Attention 能更独立地读取视觉特征，但需要修改模型结构。
-4. **视觉幻觉只是语言模型的问题吗？**
-   不是。它可能来自视觉特征缺失、模态对齐不足、训练数据偏差，也可能来自解码阶段语言先验压过视觉证据。
-
-## 二、SFT → LoRA → 蒸馏 → 多模态 SFT
-
-> **主线：**SFT 定义目标行为，LoRA 用低成本完成领域适配，蒸馏把强模型能力迁移到更小模型，多模态 SFT 进一步学习“视觉输入—语言输出”的对齐与指令跟随。
+## 二、后训练、对齐与推理工程
 
 ### 1 SFT 与参数高效微调
 
@@ -766,9 +198,9 @@ effective_batch_tokens
 PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到接近全量微调的效果，尤其适合 MoE 这种参数巨大的模型。
 
 **LoRA（Low-Rank Adaptation）**
-- **原理**：假设微调时的权重变化 `Δ W` 是低秩的，即 `Δ W = BA`，其中 `B ∈ R^{d_{out} × r}`，`A ∈ R^{r × d_{in}}`，`r ≪ min(d_{in}, d_{out})`。原始前向传播变为 `h = W_0 x + BA x`，训练时只更新 `B` 和 `A`，`W_0` 冻结。
-- **优点**：推理时可将 `BA` 合并到 `W_0` 中，不增加额外延迟；参数量极少（通常 r=8~64），效果好，社区支持广泛。
-- **缺点**：需要选择合适的秩 `r`；如果模型本身已经过拟合，低秩假设可能限制表达能力。
+- **原理**：假设微调时的权重变化 $`\Delta W`$ 是低秩的，即 $`\Delta W = BA`$，其中 $`B \in \mathbb{R}^{d_{\text{out}} \times r}`$，$`A \in \mathbb{R}^{r \times d_{\text{in}}}`$，$`r \ll \min(d_{\text{in}}, d_{\text{out}})`$。原始前向传播变为 $`h = W_0 x + BA x`$，训练时只更新 $`B`$ 和 $`A`$，$`W_0`$ 冻结。
+- **优点**：推理时可将 $`BA`$ 合并到 $`W_0`$ 中，不增加额外延迟；参数量极少（通常 r=8~64），效果好，社区支持广泛。
+- **缺点**：需要选择合适的秩 $`r`$；如果模型本身已经过拟合，低秩假设可能限制表达能力。
 
 **Adapter**
 - **原理**：在 Transformer 的每个子层（通常 FFN 后）插入一个小型 MLP，结构为“降维 → 激活 → 升维”，例如先将 768 维降为 64 维，再升回 768 维。只训练这些 Adapter 参数。
@@ -781,11 +213,6 @@ PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到
 - **优点**：参数极少（例如 100 个虚拟 token × 维度），完全不修改模型权重。
 - **缺点**：需要占用输入长度（减少可用上下文长度）；对模型规模敏感（小模型效果较差）。
 
-**IA³（Infused Adapter by Inhibiting and Amplifying Inner Activations）**
-- **原理**：对注意力机制的 K、V 以及 FFN 的输入分别乘以可学习的缩放向量（即对特征维度做逐元素缩放），每个向量长度等于特征维度。
-- **优点**：参数量极少（三个向量，约 `3 × d_{model}`），效果在不少任务上接近 LoRA。
-- **缺点**：实现相对小众，社区支持不如 LoRA。
-
 **常见问题**
 - **LoRA 为什么有效？** 微调过程中，权重的变化往往位于一个低秩子空间，这已被实验和理论验证（如 Aghajanyan et al. 2021）。
 - **LoRA 在 MoE 中如何应用？** 可以只对每个专家的 FFN 权重加 LoRA，也可以对 Attention 层加。通常为每个专家独立添加低秩矩阵，可训练参数仍然远少于全量微调。
@@ -797,36 +224,15 @@ PEFT（Parameter-Efficient Fine-Tuning）旨在用极少的可训练参数达到
 
 ##### 1.4.1 注入位置与参数量
 
-对线性层 `W ∈ R^{d_{out}× d_{in}}`，LoRA 学习：
+对线性层 $W \in \mathbb{R}^{d_{out}\times d_{in}}$，LoRA 学习：
 
 $$
 y = W x + \frac{\alpha}{r} B A x
 $$
 
-其中 `A∈R^{r× d_{in}}`、`B∈R^{d_{out}× r}`。单层可训练参数为 `r(d_{in}+d_{out})`。常见 target modules 是 Attention 的 `q_proj/k_proj/v_proj/o_proj` 和 MLP 的 `gate_proj/up_proj/down_proj`。只选 Q/V 更省参数；同时选 Attention+MLP 通常容量更强。选择应通过消融实验，不要依赖固定配方。
+其中 $A\in\mathbb{R}^{r\times d_{in}}$、$B\in\mathbb{R}^{d_{out}\times r}$。单层可训练参数为 $r(d_{in}+d_{out})$。常见 target modules 是 Attention 的 `q_proj/k_proj/v_proj/o_proj` 和 MLP 的 `gate_proj/up_proj/down_proj`。只选 Q/V 更省参数；同时选 Attention+MLP 通常容量更强。选择应通过消融实验，不要依赖固定配方。
 
-常用初始化是 `A` 随机、`B=0`，使训练开始时 LoRA 分支输出为 0，模型与基座模型完全一致。`lora_dropout` 仅应在数据小、过拟合明显时使用。
-
-下面这个最小实现把公式中的两条路径直接对应到代码。`base` 冻结，反向传播只更新 `A/B`：
-
-```python
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, rank=8, alpha=16):
-        super().__init__()
-        self.base = base.requires_grad_(False)
-        self.A = nn.Parameter(torch.empty(rank, base.in_features))
-        self.B = nn.Parameter(torch.zeros(base.out_features, rank))
-        self.scale = alpha / rank
-        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
-
-    def forward(self, x):
-        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scale
-
-    def merged_weight(self):
-        return self.base.weight + self.scale * (self.B @ self.A)
-```
-
-这里最值得检查的不是代码能否运行，而是：目标 Linear 是否真的被替换、基座参数是否冻结、`B=0` 是否保证初始输出不变，以及 merge 前后 logits 是否足够接近。
+常用初始化是 $A$ 随机、$B=0$，使训练开始时 LoRA 分支输出为 0，模型与基座模型完全一致。`lora_dropout` 仅应在数据小、过拟合明显时使用。
 
 ##### 1.4.2 LoRA 训练步骤
 
@@ -844,7 +250,7 @@ QLoRA 将冻结的基座权重以 4-bit 形式加载，计算时反量化到 BF1
 
 ##### 1.4.4 Merge、验证与部署
 
-合并操作为 `W' = W + (α)/(r)BA`。建议在 FP32/BF16 中合并，再根据目标服务格式量化，避免在低精度权重上反复 merge/unmerge 导致误差累积。合并前后用固定输入比较 logits 或生成结果，并检查 tokenizer、generation config 和特殊 token 是否一起发布。
+合并操作为 $W' = W + \frac{\alpha}{r}BA$。建议在 FP32/BF16 中合并，再根据目标服务格式量化，避免在低精度权重上反复 merge/unmerge 导致误差累积。合并前后用固定输入比较 logits 或生成结果，并检查 tokenizer、generation config 和特殊 token 是否一起发布。
 
 动态 Adapter Serving 能让多个任务共享基座权重，但需要解决 adapter 缓存、版本路由、租户隔离、batch 内 adapter 切换和冷加载延迟。合并部署的运行时更简单，但每个任务都需要独立权重副本。
 
@@ -884,22 +290,11 @@ $$
 +\alpha T^2 KL(p_t^T\parallel p_s^T)
 $$
 
-其中软分布由 `p^T = softmax(z/T)` 得到。`T>1` 将分布变平，暴露非目标类的相对概率；`T²` 用于补偿温度带来的梯度缩放。KL 方向应明确表示「用学生逼近教师」，实现时需核对库函数的 input/target 语义。
+$$
+p^T=softmax(z/T)
+$$
 
-PyTorch 的 `kl_div(input, target)` 要求 `input` 是 log-probability，因此实现时教师与学生的位置不能写反：
-
-```python
-def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
-    hard = F.cross_entropy(student_logits, labels)
-    soft = F.kl_div(
-        F.log_softmax(student_logits / T, dim=-1),
-        F.softmax(teacher_logits.detach() / T, dim=-1),
-        reduction="batchmean",
-    ) * (T * T)
-    return (1 - alpha) * hard + alpha * soft
-```
-
-教师输出要 `detach`，否则会无意中为教师构建反向图；生成任务还需对 padding 和非目标 Token 做 mask，不能直接把所有位置平均。
+$T>1$ 将分布变平，暴露非目标类的相对概率；$T^2$ 用于补偿温度带来的梯度缩放。KL 方向应明确表示「用学生逼近教师」，实现时需核对库函数的 input/target 语义。
 
 生成模型的 logits 维度是 vocabulary，完整存储成本很高，可以只保留 top-k logits 与剩余概率质量，但要注意 teacher/student tokenizer 不同时无法直接对齐 Token 分布。
 
@@ -951,11 +346,50 @@ def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
 3. **学生模型比教师更好是否矛盾？**
    不矛盾。在特定窄域任务上，数据过滤、多教师集成和更匹配的训练分布可以让学生超过单次教师输出，但不代表学生的通用能力更强。
 
-#### 1.6 多模态 SFT 全流程
+#### 1.6 多模态大模型
 
-前文已经说明视觉 Token 如何经过 Vision Encoder、Projector 进入 LLM。本节只关注在这一模型结构上如何组织监督数据、选择可训练模块并完成领域微调。
+多模态大模型将图像、视频、音频等非文本信号转换成 LLM 可以处理的 Token 表示。以视觉语言模型为例，常见架构为：
 
-##### 1.6.1 数据格式
+```text
+Image
+  → Vision Encoder（ViT / ConvNet）
+  → Visual Features
+  → Projector / Resampler / Q-Former
+  → Visual Tokens
+  → LLM 与 Text Tokens 联合建模
+  → Text / Structured Output
+```
+
+##### 1.6.1 Vision Encoder
+
+ViT 将图像分成 Patch，每个 Patch 投影为向量后通过 Transformer 编码。如果图像尺寸为 $H\times W$，Patch 尺寸为 $P\times P$，则视觉 Token 数约为：
+
+$$
+N_{vision}=\frac{H}{P}\times\frac{W}{P}
+$$
+
+提高分辨率可以保留更多细节，但视觉 Token 数按面积增长，会显著占用 Context 和 Prefill 计算。对 OCR、图表和小物体场景，常使用 dynamic resolution、tiling 或 any-resolution 策略。
+
+##### 1.6.2 Modality Projector
+
+Vision Encoder 与 LLM 的 hidden dimension、特征分布和 Token 数通常不同，Projector 负责对齐两个表示空间。
+
+- **Linear/MLP Projector**：结构简单，保留全部 Patch Token；
+- **Q-Former/Resampler**：用固定数量的可学习 Query 压缩视觉特征，减少进入 LLM 的 Token；
+- **Token Merger**：将局部相似视觉 Token 合并，在细节与成本之间取舍。
+
+##### 1.6.3 多模态对齐的阶段
+
+常见训练顺序为：
+
+1. **Feature Alignment**：冻结 Vision Encoder 和 LLM，只训练 Projector，让视觉特征进入语言空间；
+2. **Multimodal Pretraining**：用大规模图文对学习视觉概念与语言的对应；
+3. **Multimodal SFT**：用图像问答、OCR、图表、Grounding、多轮对话和结构化任务训练指令跟随；
+4. **Preference Alignment**：对幻觉、拒答、安全和输出风格进行 DPO/RLHF 对齐。
+
+#### 1.7 多模态 SFT 全流程
+
+##### 1.7.1 数据格式
 
 一条数据需要同时表达对话和媒体引用：
 
@@ -973,7 +407,7 @@ def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
 
 图像顺序必须与 `<image>` 占位 Token 一致，多图输入还要明确「图 1 / 图 2」的指代。训练与推理必须共用相同的 image processor、resize/crop 策略、归一化参数和 chat template。
 
-##### 1.6.2 训练哪些模块
+##### 1.7.2 训练哪些模块
 
 | 策略 | 显存/成本 | 适用场景 |
 |---|---:|---|
@@ -984,13 +418,13 @@ def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
 
 只对 LLM 做 LoRA 能改善指令遵循，但如果问题来自 Vision Encoder 没有提取出关键细节，语言侧无法凭空恢复丢失的视觉信息。
 
-##### 1.6.3 Batch 与显存
+##### 1.7.3 Batch 与显存
 
 图像分辨率不同会导致视觉 Token 数差异很大。如果只按样本数组 batch，少量高分辨率图像就可能 OOM。更稳定的方式是按「文本 Token + 视觉 Token」总预算做 bucketing 和 dynamic batching。
 
 多模态训练常结合 BF16、FlashAttention、gradient checkpointing、sequence packing 和 LoRA/QLoRA。Packing 时要确保媒体特征的 offset 与文本占位 Token 一致，不能只拼接 `input_ids`。
 
-##### 1.6.4 数据配比与能力退化
+##### 1.7.4 数据配比与能力退化
 
 数据应同时覆盖：
 
@@ -1002,7 +436,7 @@ def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
 
 如果训练集中每张图都必然有答案，模型容易学会在证据不足时也强行描述，形成视觉幻觉。
 
-##### 1.6.5 评估
+##### 1.7.5 评估
 
 多模态评估不能只使用通用 VQA Accuracy，还应分别观察：
 
@@ -1021,10 +455,6 @@ def distill_loss(student_logits, teacher_logits, labels, alpha=0.5, T=2.0):
    长宽同时翻倍时 Patch Token 数约变为 4 倍，进而增加 Prefill 和 Context 成本。
 3. **多模态 SFT 为什么要混入纯文本数据？**
    防止模型过度适应图文数据分布，导致原有语言理解、指令跟随和格式能力退化。
-
-## 三、DPO / PPO / GRPO：目标、数据与取舍
-
-> **主线：**当 SFT 只能模仿标准答案时，偏好优化进一步学习“哪个回答更好”。DPO 直接用 chosen/rejected 对优化；PPO 需要奖励模型与在线采样；GRPO 用组内相对优势降低价值模型成本。
 
 ### 2 RLHF（基于人类反馈的强化学习）
 
@@ -1063,17 +493,21 @@ RLHF 通常分三步走：**SFT**（使用监督数据微调）、**奖励模型
 #### 2.2 奖励模型训练
 
 **模型结构**
-奖励模型通常基于 SFT 模型（也可以使用更小的模型），将最后的语言建模头替换为一个 **标量输出头**（如线性层加 sigmoid），用于输出一个奖励值 `r(x,y)`，表示在 prompt `x` 下回答 `y` 的好坏。
+奖励模型通常基于 SFT 模型（也可以使用更小的模型），将最后的语言建模头替换为一个 **标量输出头**（如线性层加 sigmoid），用于输出一个奖励值 $`r(x,y)`$，表示在 prompt $`x`$ 下回答 $`y`$ 的好坏。
 
 **损失函数**
-使用 **pairwise ranking loss**：`L = -log sigmoid(r_chosen-r_rejected)`。
+使用 **pairwise ranking loss**（对比损失）：
 
-其中 `σ` 是 sigmoid 函数。该损失鼓励模型给 chosen 的回答打更高的分，rejected 的回答打更低的分。
+$$
+\mathcal{L} = -\log \sigma\left(r_\theta(x, y_{\text{chosen}}) - r_\theta(x, y_{\text{rejected}})\right)
+$$
+
+其中 $`\sigma`$ 是 sigmoid 函数。该损失鼓励模型给 chosen 的回答打更高的分，rejected 的回答打更低的分。
 
 **训练技巧**
 - **批处理**：由于每个 prompt 可能有多对 `(chosen, rejected)`，需要确保同一 prompt 下的所有对在同一个 batch 中，以便正负例来自相同上下文。
 - **正则化**：使用权重衰减、dropout 等防止过拟合。
-- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 `r(x, y_{chosen}) > r(x, y_{rejected})` 的正确比例。此外，也可用人机对比评估。
+- **评估**：在验证集上计算 **一致性（accuracy）**，即模型对 $`r(x, y_{\text{chosen}}) > r(x, y_{\text{rejected}})`$ 的正确比例。此外，也可用人机对比评估。
 
 **常见问题**
 - **为什么不用均方误差（MSE）预测绝对分数？** 因为绝对分数难以标注且主观性强，pairwise 更稳定。
@@ -1083,80 +517,38 @@ RLHF 通常分三步走：**SFT**（使用监督数据微调）、**奖励模型
 
 #### 2.3 RL 策略（PPO、DPO、GRPO）
 
-先用同一个问题建立直觉。模型回答一道数学题时，可能给出 A、B 两个解法：A 正确且清晰，B 有错误。三种方法的共同目标都是让模型以后更偏向 A；区别只在于**反馈从哪里来、是否需要模型自己探索、如何判断一次更新该走多大**。
-
-| 方法 | 模型看到的反馈 | 一句话理解 | 适合什么场景 |
-|---|---|---|---|
-| DPO | 已标好的 `chosen > rejected` | 直接让 A 的相对概率高于 B | 有高质量离线偏好数据，希望简单稳定 |
-| PPO | 模型新生成的回答 + Reward Model 打分 | 先探索，再按分数小步修正 | 有可调用的奖励模型，需要持续探索 |
-| GRPO | 同一问题采样的一组回答及其奖励 | 只比这一组里谁更好，省掉 Critic | 可验证奖励的推理任务，如数学、代码 |
-
-可以把它们看成三种反馈闭环：
-
-```text
-DPO：标注偏好对 ─────────────→ 直接提高 chosen、压低 rejected
-PPO：当前模型 → 生成回答 → Reward Model 打分 → 小步更新当前模型
-GRPO：当前模型 → 同题生成一组回答 → 组内比较奖励 → 小步更新当前模型
-```
-
 ##### PPO（Proximal Policy Optimization）
 
-PPO 是在线 RL 算法。它不只学习旧数据中 “A 胜过 B”，而是让当前模型亲自生成新答案、交给 Reward Model 打分，再据此更新。因此它的能力上限取决于探索和奖励模型质量，但工程链路也最长。
-
-把一次 PPO 更新想成“写作—阅卷—订正”：模型写出回答，Reward Model 阅卷；高分 Token 的概率应上升、低分 Token 的概率应下降，但每次订正都不能过猛，以免把原有 SFT 能力改坏。
-
-例如模型解一道题，连续两次给出不同过程：第一次最终答案错、Reward 为 0；第二次过程严谨且答案对、Reward 为 1。PPO 不只是笼统地记住“第二篇更好”，而是把第二次生成过程中的每个 Token 都回看一遍：哪些选择更可能把答案带向高分，就提高其概率；哪些选择更可能导致低分，就降低其概率。Critic 的作用是估计“这道题平均大概能得多少分”，从而区分“真的很好”与“只是比预期稍好”。
+PPO 是在线 RL 算法，它将奖励模型作为环境，通过交互式采样来优化策略。
 
 **核心流程**：
-1. **采样**：从当前策略 `π_θ` 中采样一批 prompt 并生成回答。
-2. **打分**：用奖励模型计算每个回答的奖励 `r(x,y)`。
-3. **优势估计**：将奖励换成“比预期好多少”的优势 `A_t`。通常由 Critic（价值模型）估计预期分数；`A_t>0` 表示这一步值得鼓励，`A_t<0` 表示应收敛。
-4. **策略更新**：先计算新旧策略对同一动作的概率比：
+1. **采样**：从当前策略 $`\pi_\theta`$ 中采样一批 prompt 并生成回答。
+2. **打分**：用奖励模型计算每个回答的奖励 $`r(x,y)`$。
+3. **优势估计**：使用 GAE（Generalized Advantage Estimation）计算每个 token 的优势函数 $`A_t`$，通常需要一个 critic 模型（价值网络）来估计状态价值。
+4. **策略更新**：最大化目标函数
 
 $$
-r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\mathrm{old}}(a_t|s_t)}
+\mathcal{L}_{\text{PPO}} = \mathbb{E} \left[ \min\left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)} A, \ \text{clip}\left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}, 1-\epsilon, 1+\epsilon \right) A \right) \right]
 $$
 
-如果优势 `A_t > 0`，说明该动作值得提高概率；如果 `A_t < 0`，则应降低概率。PPO 不允许概率比 `r_t(θ)` 在一次更新中偏离 1 太远，因此使用裁剪后的策略目标：
-
-$$
-L_{PPO}=\mathbb{E}_t\left[\min\bigl(r_tA_t,\ \mathrm{clip}(r_t,1-\epsilon,1+\epsilon)A_t\bigr)\right]
-$$
-
-`clip` 将有效更新限制在旧策略附近，避免少量高优势样本让策略一步走得过远。实际训练还要同时考虑三部分：
-
-```text
-总目标 = 策略目标 L_clip
-       - 价值函数误差
-       - β × 与参考策略的 KL
-       + 熵奖励（可选）
-```
-
-其中 Critic 通过价值函数误差学习状态价值；KL 约束当前策略不要偏离参考策略（通常是 SFT 模型）太远；熵奖励用于避免策略过早变得确定。
-
-5. **价值更新**：更新 Critic，改善后续 GAE 的优势估计。
+   同时加入 KL 散度惩罚项，防止策略偏离参考策略（通常是 SFT 模型）太远。
+5. **价值更新**：更新 critic 网络，减小价值估计误差。
 
 **优点**：训练稳定，通过 KL 约束保留了 SFT 模型的生成能力；能充分利用奖励模型。
 **缺点**：需要同时维护四个模型（actor, critic, reference, reward），显存占用大，实现复杂。
 
-**什么时候想到 PPO？** 当“好坏”无法完全写成一份静态偏好集、但可以用 Reward Model 持续评估模型新答案时。代价是每轮都要生成、打分、计算优势并更新多套模型，因此它更像完整但昂贵的在线闭环。
-
 
 ##### DPO（Direct Preference Optimization）
 
-DPO 将 RLHF 转成一个直接的偏好学习问题，不训练 Reward Model，也不要求模型在线采样。数据只需告诉它：同一问题下，回答 A 比回答 B 好。
+DPO 将 RLHF 转化为 **分类问题**，无需奖励模型和在线采样，直接使用偏好数据优化策略。
 
-直觉上，DPO 要求模型同时满足两件事：相对参考模型，`chosen` 的概率提高，`rejected` 的概率降低；两者拉开的差距越大，损失越小。参考模型像一根安全绳，防止模型为了迎合少量偏好样本而偏离 SFT 太远。
-
-继续用 A、B 两个回答举例：训练时模型不必重新写一遍答案，也没有人在线给它打分；它只需要比较“在相同 prompt 下，我给 A 的概率是否已经比参考模型更高，同时给 B 的概率是否更低”。所以 DPO 本质上是**从已有偏好对中做一次有方向的概率对比**，不是让模型在环境中试错。
-
-**核心思想**：比较两项相对参考模型的变化：`chosen 相对增益 - rejected 相对增益`。完整目标为：
+**核心思想**：从偏好数据中推导出一个隐式奖励函数，并通过最大似然直接优化策略。损失函数为：
 
 $$
-\mathcal{L}_{DPO}(\pi_\theta; \pi_{ref}) = -\mathbb{E}_{(x,y_w,y_l) \sim \mathcal{D}} \left[ \log \sigma\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]
+\mathcal{L}_{\text{DPO}}(\pi_\theta; \pi_{\text{ref}}) = -\mathbb{E}_{(x,y_w,y_l) \sim \mathcal{D}} \left[ \log \sigma\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} \right) \right]
 $$
 
-训练让这个差值为正且逐渐增大；外层用 log-sigmoid 转成损失。`β` 控制偏好更新强度，`π_ref` 通常是固定的 SFT 模型。
+其中 $`\beta`$ 是控制 KL 惩罚强度的超参数，$`\pi_{\text{ref}}`$ 是固定的参考策略（通常为 SFT 模型）。
 
 **优点**：
 - 只需维护两个模型（策略和参考），无需 critic 和奖励模型，显存减半。
@@ -1167,49 +559,34 @@ $$
 - 理论上 DPO 假设偏好数据符合 Bradley-Terry 模型，当实际偏好非此模型时可能有偏差。
 - 由于不与环境交互，无法利用奖励模型进一步探索新回答，可能局限于训练数据中的偏好分布。
 
-**什么时候想到 DPO？** 当团队已有可信的 `chosen/rejected` 数据，希望先获得稳定、低工程成本的对齐收益时。它通常是偏好优化的好起点；但如果数据没有覆盖到的问题很多，DPO 不会自己探索出那些新解法。
-
 
 ##### GRPO（Group Relative Policy Optimization）
 
-GRPO 是 PPO 的轻量变体。对同一个问题一次采样 `G` 个回答，例如 8 个解题过程；如果其中 6 个错、2 个对，就让正确回答相对增加概率。它不问“这题理论上该得几分”，只问“这一组里谁更好”，因此可以不用 Critic。
-
-这特别适合有**可验证奖励**的任务：数学答案是否正确、代码能否通过测试、格式是否满足约束。奖励不必被标得非常精确，只要能把同一组候选大致排出高低即可。
-
-例如同一题一次生成 8 个解法，其中 2 个通过判题器、6 个失败：GRPO 把这 8 个回答当作一个“小组”。通过的回答相对组均值更好，得到正优势；失败回答相对更差，得到负优势。这样模型学的不是绝对分数“0.8 到底意味着什么”，而是“在同一次尝试的候选中，哪些推理路径更值得保留”。
+GRPO 是 DeepSeek 提出的 PPO 变体，旨在降低显存占用并简化训练流程。
 
 
-**优势计算**（无 Critic，用组内均值做基线）：
+**优势计算**（无 critic，用组内均值做基线）：
 
 $$
-\bar r=\frac{1}{G}\sum_{j=1}^{G}r_j,\qquad
-s_r=\sqrt{\frac{1}{G}\sum_{j=1}^{G}(r_j-\bar r)^2}
+A_i = \frac{r_i - \text{mean}(r_1,\dots,r_G)}{\text{std}(r_1,\dots,r_G)}
 $$
 
-$$
-A_i=\frac{r_i-\bar r}{s_r+\delta}
-$$
+其中 $`G`$ 为每组采样回答数。
 
-其中 `G` 为每组采样回答数。
-
-得到组内优势后，策略更新继续复用 PPO 风格的概率比与 clip：
+**策略损失**（带 clip）：
 
 $$
-\mathcal{L}_{GRPO} = -\frac{1}{G}\sum_{i=1}^G \min\left( \frac{\pi_\theta(o_i|x)}{\pi_{ref}(o_i|x)} A_i,\ c_\epsilon\left(\frac{\pi_\theta(o_i|x)}{\pi_{ref}(o_i|x)}\right) A_i \right)
+\mathcal{L}_{\text{GRPO}} = -\frac{1}{G}\sum_{i=1}^G \min\left( \frac{\pi_\theta(o_i|x)}{\pi_{\text{ref}}(o_i|x)} A_i,\ \text{clip}\left(\frac{\pi_\theta(o_i|x)}{\pi_{\text{ref}}(o_i|x)}, 1-\epsilon,1+\epsilon\right) A_i \right)
 $$
-
-因此 `A_i>0` 的回答概率会提高，`A_i<0` 的回答概率会降低，同时 clip 限制单次更新幅度。
 
 
 **核心创新**：
 - 对每个 prompt，采样一组回答（group），用组内的平均奖励作为基线（baseline），代替 critic 网络的价值估计。
-- 优势函数用组均值 `mean(r)` 作基线：高于均值的回答 `A_i>0`，低于均值的回答 `A_i<0`。
+- 优势函数定义为 $`A_i = r_i - \text{mean}(r_{\text{group}})`$，其中 $`r_i`$ 是第 $`i`$ 个回答的奖励。
 - 策略更新仍使用 PPO 的 clip 目标，但无需单独的价值网络，从而节省显存。
 
 **优点**：显存占用低于 PPO（少一个 critic 模型），且通过组内相对比较缓解了奖励尺度不一致的问题。
 **缺点**：方法较新，社区验证较少；组大小选择需权衡（过小则基线不稳定，过大则增加采样成本）。
-
-**什么时候想到 GRPO？** 当每题能低成本获得可靠的验证信号时最合适，例如单元测试、答案校验器、规则检查器。若奖励主要依赖细腻的人类主观偏好、且每题只采到极少候选，组内比较的信号会弱，此时未必比 DPO 或 PPO 更合适。
 
 **常见问题**
 - **PPO vs DPO 的核心区别**：PPO 是在线 RL，需要奖励模型和 critic，采样成本高但可探索；DPO 是离线优化，直接利用静态偏好数据，实现简单但依赖数据质量。
@@ -1224,13 +601,149 @@ $$
 
 结果：模型生成更长、更结构化的推理链，甚至出现自我校正行为。
 
-### 3 训练系统：分布式并行与混合精度
 
-TP、PP、DP 都是计算并行维度，并非训练专属；但梯度同步、Micro-batch Pipeline、3D Parallel 和 ZeRO 主要属于**训练系统**。在线推理也会使用 TP/PP 部署单卡放不下的模型，而扩展请求吞吐通常称为多 Replica 部署，不要直接套用训练 DP 的梯度同步语义。
+### 3 推理优化
 
-![DP、TP、PP 的切分方式与通信差异](figures/distributed-training-parallelism.png)
+#### 3.1 KV Cache
 
-#### 3.1 分布式训练（TP、PP、DP）
+**原理**
+在自回归生成时，每一步需要计算当前 token 与之前所有 token 的注意力。如果每次都重新计算所有历史 token 的 K 和 V，会引入大量重复计算。KV Cache 将已生成的 token 的 K、V 缓存在内存中，新 token 只需计算自己的 K、V，然后与缓存中的 K、V 拼接后进行注意力计算。
+
+**内存占用**
+KV Cache 的大小为：
+
+```math
+\text{内存} = 2 \times \text{batch\_size} \times \text{num\_heads} \times \text{seq\_len} \times \text{head\_dim} \times \text{sizeof(dtype)}
+```
+
+例如，Llama 2 7B（32 heads，head_dim=128）使用 FP16，batch=1，seq_len=4096 时，KV Cache 约
+
+$$
+2 \times 1 \times 32 \times 4096 \times 128 \times 2 \text{ bytes} = 2 \times 32 \times 4096 \times 256 \text{ bytes} = 2 \times 32 \times 1,048,576 \text{ bytes} = 67,108,864 \text{ bytes} \approx 64 \text{ MB}
+$$
+
+当 seq_len 达到 32k 时，占用约 512 MB，对于大 batch 或多头模型，KV Cache 会成为显存瓶颈。
+
+**优化技巧**
+- **MQA（Multi-Query Attention）**：所有注意力头共享同一组 K、V，将 KV Cache 大小减少到原来的 $`1/\text{num\_heads}`$，但可能影响模型质量。
+- **GQA（Grouped-Query Attention）**：将查询头分组，每组共享 K、V，在性能与内存之间取得平衡（如 Llama 2 7B 采用 GQA）。
+- **KV Cache 量化**：将缓存的 K、V 量化为 INT8 或 FP8，可显著降低显存占用，但需要小心精度损失。
+
+**常见问题**
+- **KV Cache 为什么能加速？** 将每步的 $`O(S^2)`$ 复杂度降为 $`O(S)`$，但需要额外显存。
+- **长上下文场景下 KV Cache 如何优化？** 可以通过 GQA、量化、分块处理（如 StreamingLLM 只保留部分缓存）来缓解。
+- **如何实现 KV Cache？** 可以进一步用伪代码说明用伪代码描述生成过程中如何维护和更新缓存。
+
+
+#### 3.2 Flash Attention
+
+**原理**
+
+Flash Attention 是一种 **IO-aware** 的精确注意力实现，核心思想是 **分块（tiling）** 和 **重计算**，以最小化 GPU 显存（HBM）与片上 SRAM 之间的数据移动。
+
+标准注意力计算需要将 $`QK^T`$ 这个 $`S \times S`$ 矩阵写入 HBM，然后读取进行 softmax，再与 V 相乘。HBM 带宽远低于 SRAM，导致大量时间浪费在数据搬运上。
+
+Flash Attention 将 Q、K、V 切分成小块（block），在 SRAM 中完成小块内的 softmax 和矩阵乘法，只将最终结果写回 HBM，避免了中间矩阵的读写。
+
+**版本演进**
+- **FlashAttention v1**：提出了分块 softmax 的数学技巧，使得在 SRAM 内可以安全合并不同块的 softmax 结果，实现了与标准 attention 完全等价的输出。
+- **FlashAttention v2**：优化了并行策略（warp 级别的调度），减少了非矩阵乘的运算，速度比 v1 快 2-4 倍。
+- **FlashAttention-3**（最新）：针对 H100 架构优化，利用异步指令和更高效的分块，进一步提升性能。
+
+**适用场景**
+
+Flash Attention 在长序列（如 8k、32k）时优势极为明显，短序列（如 512）提升有限。它同时支持训练和推理，且与 KV Cache 兼容（推理时仍可对缓存分块）。
+
+**常见问题**
+- **Flash Attention 如何减少内存访问？** 通过分块和在线 softmax，避免将 $`QK^T`$ 矩阵写入 HBM，大幅减少内存读写。
+- **Flash Attention 与标准 attention 是否等价？** 是，输出数值上完全一致（忽略浮点误差）。
+- **为什么 Flash Attention 对长序列特别有用？** 因为 $`QK^T`$ 的显存占用随 $`S^2`$ 增长，Flash Attention 避免了这一显存瓶颈，且能充分利用 SRAM 加速。
+
+
+
+#### 3.3 INT8 量化
+
+量化的目标是用更少的 bit 表示权重或激活，减少模型显存、显存带宽和在硬件支持下的矩阵乘开销。INT8 的优势首先来自数据量：相比 FP16，同样数量的权重理论存储减半。
+
+##### 3.3.1 线性量化
+
+对称 INT8 量化将实数 $x$ 映射到 $[-127,127]$：
+
+$$
+s=\frac{\max |x|}{127},\qquad
+q=clip(round(x/s),-127,127),\qquad
+\hat{x}=s\cdot q
+$$
+
+非对称量化额外使用 zero point：
+
+$$
+q=clip(round(x/s)+z,q_{min},q_{max}),\qquad
+\hat{x}=s(q-z)
+$$
+
+对称量化计算更简单，常用于权重；非对称量化能更好覆盖不对称分布，但需处理 zero point。
+
+##### 3.3.2 Per-tensor、Per-channel 与 Per-token
+
+- **Per-tensor**：整个张量共享一个 scale，实现简单，但易被少数离群值拉大范围；
+- **Per-channel**：权重每个输出通道使用独立 scale，通常能明显降低权重量化误差；
+- **Per-token**：激活每个 Token 动态计算 scale，适应不同 Token 的幅值，但引入动态统计开销。
+
+量化粒度越细，误差通常越小，但 scale 存储、Kernel 实现和调度更复杂。
+
+##### 3.3.3 Weight-only 与 W8A8
+
+**Weight-only INT8（W8A16）**：权重以 INT8 存储，计算前或 Kernel 内反量化到 FP16/BF16，激活保持高精度。它主要降低权重显存和读取带宽，精度风险较低，但若 Kernel 只是先反量化再做 FP16 GEMM，计算加速可能有限。
+
+**W8A8**：权重和激活都使用 INT8，可直接利用 INT8 Tensor Core，但激活中的 outlier 会让量化更困难。因此 W8A8 的速度潜力更高，对校准数据和 Kernel 支持的要求也更高。
+
+##### 3.3.4 Outlier 与 SmoothQuant
+
+假设激活大部分位于 $[-1,1]$，却有少数值达到 50。如果整个 Tensor 用同一 scale，量化范围必须覆盖 50，$[-1,1]$ 中的大量数值就会挤在少数刻度中，丢失精度。
+
+SmoothQuant 利用线性层 $Y=XW$ 的等价变换，将激活中难量化的幅值部分迁移到权重：
+
+$$
+Y=(X\,diag(s)^{-1})(diag(s)W)
+$$
+
+对激活做平滑后，激活更容易量化，权重通常比激活更能承受这部分尺度变化。平滑强度需在两侧误差之间取舍。
+
+##### 3.3.5 PTQ、Calibration 与 QAT
+
+**PTQ** 在训练后根据权重和少量校准数据确定 scale/clipping，成本低，是部署中的常用选择。Calibration 数据不需要很大，但必须覆盖真实任务的长度、语言、模态和激活分布；只用随机短文本会导致线上 outlier 范围估计失真。
+
+**QAT** 在训练中插入 fake quantization，前向模拟 round/clip，反向通常使用 Straight-Through Estimator 近似梯度。它能让模型适应量化误差，但训练成本高、工程复杂。
+
+##### 3.3.6 哪些部分需要保留高精度
+
+不是所有算子都适合 INT8。常见做法是将 LayerNorm/RMSNorm、Softmax、采样与部分敏感层保留为 FP16/BF16，将主要 Linear/GEMM 量化。敏感层可通过逐层误差、消融实验或 Hessian/激活统计识别。
+
+KV Cache 精度与权重量化互相独立。将权重改为 INT8 不代表 KV Cache 也自动变成 INT8，因此长上下文、高并发场景仍可能被 KV Cache 显存限制。
+
+##### 3.3.7 量化后的端到端验证
+
+量化效果不能只用权重文件大小衡量，应在同一硬件、并发、上下文与生成长度下比较：
+
+- 任务 Accuracy/F1、困惑度或生成质量；
+- JSON Schema/Tool Call 合法率与长序列稳定性；
+- 峰值 GPU 显存，并区分权重、KV Cache 和 Runtime Workspace；
+- TTFT、TPOT、P95/P99 与 output tokens/s；
+- 不同长度、语言、类别和多模态数据分层指标。
+
+显存减少也不必然等于延迟下降。如果硬件没有高效 INT8 Kernel，或频繁 Quantize/Dequantize，低精度可能只省显存而不加速。
+
+**常见问题**
+
+1. **W8A16 和 W8A8 的核心差别？**
+   W8A16 主要压缩权重存储和带宽；W8A8 还量化激活，可使用 INT8 GEMM，但对 outlier 和校准更敏感。
+2. **为什么 INT8 显存不一定正好是 FP16 的 50%？**
+   只有被量化的权重接近减半，scale、高精度层、KV Cache、CUDA Workspace 和显存碎片都不按同一比例缩放。
+3. **为什么量化后显存降了，速度却可能没提升？**
+   运行时可能缺少原生 INT8 Kernel，或反量化、数据转换和其他非 GEMM 算子成为新瓶颈。
+
+#### 3.4 分布式训练（TP、PP、DP）
 
 ##### 数据并行（DP）
 - **原理**：每张 GPU 持有完整的模型副本，处理不同的数据分片。前向和反向独立计算，梯度通过 AllReduce 同步，确保所有副本参数一致。
@@ -1270,7 +783,7 @@ ZeRO 允许在数据并行的框架下训练比单卡显存大得多的模型，
 - **ZeRO 相比 DP 的优势**：ZeRO 消除了冗余，使显存占用随 GPU 数量线性扩展，可训练远超单卡容量的模型。
 - **MoE 与专家并行**：MoE 天然适合专家并行（Expert Parallelism），将不同专家分布到不同 GPU，通过 All-to-All 通信实现路由，本质上是 TP 的一种特例。
 
-#### 3.2 混合精度训练（BF16 vs FP16）
+#### 3.5 混合精度训练（BF16 vs FP16）
 
 | 特性 | FP16 | BF16 |
 |------|------|------|
@@ -1281,7 +794,7 @@ ZeRO 允许在数据并行的框架下训练比单卡显存大得多的模型，
 | 精度 | 较高 | 较低 |
 
 **损失缩放（FP16 必需）**：
-反向传播前将 loss 乘以 `S`（如 128），梯度更新后除以 `S`。
+反向传播前将 loss 乘以 $`S`$（如 128），梯度更新后除以 $`S`$。
 
 **代码（PyTorch）**：
 ```python
@@ -1307,140 +820,23 @@ scaler.update()
    → 低精度矩阵乘法利用 Tensor Core，同时减少显存带宽占用。
 
 
-## 四、KV Cache → FlashAttention → vLLM 推理引擎
+#### 3.6 在线推理请求全链路
 
-> **主线：**KV Cache 避免生成时反复计算历史 Token；FlashAttention 不改变 Attention 结果，而是减少中间矩阵的 HBM 搬运。两者分别优化“重复计算”和“数据搬运”。
-
-![大模型推理链路与各类优化的作用位置](figures/llm-inference-optimization-map.png)
-
-先不要把所有技术都理解成“让模型算得更快”。它们解决的是不同浪费：
-
-| 看到的浪费 | 对应机制 | 核心动作 |
-|---|---|---|
-| 每生成一个 Token 都重算历史 | KV Cache | 保存历史 K/V |
-| Attention 中间矩阵反复进出 HBM | FlashAttention | 在 SRAM 中分块算完 |
-| KV Cache 预留过多、显存碎片 | PagedAttention | 用固定 Block 按需分页 |
-| 不同请求重复计算相同 Prompt | vLLM APC | 按 Block Hash 复用前缀 KV |
-| Batch 被最长序列拖住 | Continuous Batching | 每轮动态加入、移除请求 |
-| Decode 一次只能产生一个 Token | Speculative Decoding | 小模型猜，目标模型并行验证 |
-
-因此可以先记住：**KV Cache 省重复计算，FlashAttention 省数据搬运，PagedAttention 省显存浪费，APC 省重复 Prefill，Continuous Batching 省 GPU 空转。**
-
-#### 4.1 KV Cache
-
-大模型生成不是一次写完整句话，而是每次预测一个 Token：
+先用一个请求理解整条链路。用户发送「阅读这份 20k Token 的文档并总结」，并要求流式返回：
 
 ```text
-输入：我喜欢吃
-第 1 步：我喜欢吃 → 苹果
-第 2 步：我喜欢吃苹果 → ，
-第 3 步：我喜欢吃苹果， → 因为
+1. 网关验证身份、计算 Token、检查配额
+2. Router 选择一个健康且负载合适的 vLLM 副本
+3. Scheduler 将请求排入队列，为它预留 KV Cache Block
+4. Prefill 并行读完 20k Token，生成首个 Token
+5. Decode 逐个生成后续 Token，网关通过 SSE 边生成边返回
+6. 用户点击停止，cancellation 传到 vLLM，序列退出调度
+7. KV Block 引用计数减少，可回收块返回 Block Pool
 ```
 
-Transformer 每一层都会把 Token 投影成 Q、K、V。生成新 Token 时，它的 Q 需要与所有历史 Token 的 K 做匹配，再用注意力权重聚合历史 V。问题在于：历史 Token 的 K、V 一旦算出便不会改变，如果每一步都重新计算它们，就像写文章时每打一个字都重新阅读并抄写全文。
+这条链路有两类调度：网关在多个推理副本之间做**粗粒度调度**，vLLM 在一个副本内对多条序列做**Token 粒度调度**。网关解决「请求送到哪里」，推理引擎解决「GPU 这一轮算哪些 Token」。
 
-KV Cache 的做法是把每层已经算过的 K、V 留在显存中：
-
-```text
-第 1 步：计算 Prompt 全部 K/V，并缓存
-第 2 步：只计算新 Token 的 Q/K/V，读取历史 Cache
-第 3 步：把新 K/V 追加进 Cache，继续生成
-```
-
-```python
-kv_cache = empty_cache()
-
-hidden, prompt_keys, prompt_values = model.prefill(prompt_tokens)
-kv_cache.append(prompt_keys, prompt_values)    # Prompt Token 可并行计算
-
-while not finished:                           # Decode：逐 Token 进行
-    query, new_key, new_value = project(last_token)
-    hidden = attention(query, kv_cache.keys, kv_cache.values)
-    kv_cache.append(new_key, new_value)
-    last_token = sample(hidden)
-```
-
-这段代码只表达数据流。真实实现会同时处理所有层、多个请求和分块 Cache。
-
-**它加速了什么，又付出了什么？**
-
-- 省掉的是每一步对历史 Token 做重复投影和前向计算；
-- 没省掉新 Token 对全部历史 K/V 的读取，所以 Decode 仍会随上下文变长而变慢；
-- 代价是用显存保存每一层、每个历史 Token 的 K 和 V。
-
-**内存占用**
-标准多头注意力下，整模型 KV Cache 的大小为：
-
-$$
-M_{KV}=2LBN_{KV}SDb
-$$
-
-其中，`L` 为层数，`B` 为并发序列数，`N_{KV}` 为 KV Head 数，`S` 为序列长度，`D` 为 Head Dim，`b` 为每个元素的字节数。
-
-系数 2 对应 Key 和 Value。使用 GQA/MQA 时应代入 `num_kv_heads`，而不是 Query Head 数。
-
-例如，Llama 2 7B 有 32 层、32 个 KV Head，`head_dim=128`。使用 FP16、`batch=1`、`seq_len=4096` 时，**单层** KV Cache 为：
-
-$$
-2 \times 1 \times 32 \times 4096 \times 128 \times 2\mathrm{ bytes}
-=64\mathrm{ MiB}
-$$
-
-乘以 32 层后，整模型约为：
-
-$$
-32\times64\mathrm{ MiB}=2048\mathrm{ MiB}=2\mathrm{ GiB}
-$$
-
-当上下文从 4k 增加到 32k 时，KV Cache 线性扩大 8 倍，单请求约占 16 GiB。再叠加 Batch 和并发序列后，KV Cache 很容易超过模型权重之外的剩余显存。
-
-这也解释了为什么「权重能放进 GPU」不等于「服务扛得住并发」：权重由请求共享，KV Cache 基本按请求增长。上例单请求 4k Context 已占约 2 GiB；变成 32k 就约 16 GiB，再乘并发数很快 OOM。
-
-降低 KV Cache 压力主要有三条路：
-
-- **GQA/MQA**：让多个 Query Head 共享较少的 KV Head，从源头减少每个 Token 需要保存的 K/V；
-- **KV Cache 量化**：用 FP8/INT8 保存 K/V，减少容量和读取带宽，但需要验证精度；
-- **分页管理**：不减少 KV 数据本身，而是用 PagedAttention 降低预留和碎片浪费。
-
-**常见问题**
-- **为什么有 KV Cache，长上下文 Decode 还是会慢？** 新 Token 不必重算历史 K/V，但 Attention 仍要读取全部历史 K/V，瓶颈常从计算转为显存容量和带宽。
-- **为什么 Cache 保存 K/V，不保存 Q？** 历史 K/V 会被未来每个新 Query 使用；历史 Q 完成当步 Attention 后通常不会再用。
-- **KV Cache 与 Prefix Cache 是一回事吗？** 不是。KV Cache 复用同一请求的历史计算；Prefix Cache 让不同请求复用相同前缀的 KV。
-
-
-#### 4.2 Flash Attention
-
-FlashAttention 解决的不是 KV Cache 容量，而是 **Attention 计算过程中搬运中间数据太慢**。
-
-以 8k Token 为例，注意力分数矩阵有 `8192 × 8192` 个元素。普通实现大致经历：
-
-```text
-Q、K 从 HBM 读入
-→ 计算完整 QKᵀ
-→ 把巨大分数矩阵写回 HBM
-→ 再读出做 Softmax
-→ 再与 V 相乘
-```
-
-GPU 的矩阵乘法很快，但 HBM 和计算单元之间来回搬运这个 `S× S` 中间矩阵很贵。可以把 HBM 理解为仓库，片上 SRAM 理解为工位：普通 Attention 反复把整批半成品送回仓库；FlashAttention 则把 Q、K、V 分成能放进工位的小块，在 SRAM 中完成“打分 → Softmax → 聚合 V”，最后只把输出写回 HBM。
-
-```text
-普通 Attention：算一段 → 写巨大中间矩阵 → 再读回来 → 继续算
-FlashAttention：读一个小块 → 在 SRAM 内算完 → 只写最终结果
-```
-
-难点是 Softmax 依赖一整行分数。FlashAttention 使用 Online Softmax，维护每行当前最大值和归一化和，使分块结果能够逐步合并，因此不是近似 Attention，只存在正常的浮点误差。
-
-它同时减少中间显存占用和 HBM IO，序列越长价值通常越明显。训练和 Prefill 会处理许多 Query Token，收益尤其直观；单 Token Decode 的核心压力更多是读取历史 KV，因此不能把 FlashAttention 当成所有推理瓶颈的答案。
-
-**常见问题**
-- **它是不是减少了 Attention 的理论计算量？** 主要没有；核心收益来自减少 HBM IO 和中间张量，而不是把 Attention 变成线性复杂度。
-- **它与 KV Cache 有什么区别？** KV Cache 避免重复计算历史 K/V；FlashAttention 优化一次 Attention 内部如何计算和搬数据。
-- **它与 PagedAttention 有什么区别？** FlashAttention 管“怎么算”，PagedAttention 管“变长 KV Cache 怎么存”。二者可以同时使用。
-
-
-
-### 4.3 Prefill / Decode 与性能指标
+##### 3.6.1 先记住四个性能指标
 
 | 指标 | 用户感受 | 主要受什么影响 |
 |---|---|---|
@@ -1449,22 +845,185 @@ FlashAttention：读一个小块 → 在 SRAM 内算完 → 只写最终结果
 | E2E Latency | 整个回答何时完成 | TTFT + 输出长度 × TPOT |
 | Throughput | 集群每秒完成多少请求/Token | Batch、调度、GPU 利用率 |
 
-例如一个请求 TTFT 为 1 s，之后生成 200 Token，TPOT 为 30 ms，那么用户大约在 1 s 后看到首字，完整等待时间约为 `1 + 200 × 0.03 = 7` s。优化 TTFT 与优化 TPOT 解决的是两种不同的体感问题。
+例如一个请求 TTFT 为 1 s，之后生成 200 Token，TPOT 为 30 ms，那么用户大约在 1 s 后看到首字，完整等待时间约为 $1 + 200 \times 0.03 = 7$ s。优化 TTFT 与优化 TPOT 解决的是两种不同的体感问题。
 
-#### 4.3.1 Prefill 与 Decode
+##### 3.6.2 Prefill 与 Decode
 
 可以把自回归生成想成「先读题，再逐字作答」：
 
 - **Prefill**：一次处理全部输入 Token，计算量大且并行度高，通常更偏计算密集；
 - **Decode**：每次生成一个新 Token，需要反复读取历史 KV Cache，通常更偏显存带宽密集。
 
-Prefill 像一次性读完题目：Prompt Token 可以并行计算，通常更吃算力，并决定 TTFT。Decode 像逐字作答：下一个 Token 必须等待上一个 Token，每一步还要读取历史 KV，通常更吃显存带宽，并决定 TPOT。
+Prefill 像一次性读完题目：所有 Prompt Token 可以并行计算，GPU 的矩阵乘法单元很忙。Decode 像逐字写答案：第 $t$ 步必须等第 $t-1$ 步产生的 Token，每次计算量不大，但都要从显存读取前面全部 Token 的 KV，因此容易受显存带宽限制。
 
-这里先理解两个阶段即可：KV Cache 为什么存在见 4.1，FlashAttention 如何优化 Prefill 见 4.2，vLLM 如何管理 KV、调度请求和复用公共前缀见 4.6。
+假设 Prompt 长 10k Token，要生成 100 Token：
 
-### 4.4 vLLM 核心架构与推理机制
+- 没有 KV Cache：第 1 步重算 10k Token，第 2 步重算 10001 Token，之后每步都重算整段历史；
+- 有 KV Cache：Prefill 时将 10k Token 的 K/V 存下，Decode 每步只计算新 Token 的 Q/K/V，再与历史 K/V 做 Attention。
 
-vLLM 的核心价值是把「单个模型的前向计算」变成「多请求共享 GPU 的高吞吐推理系统」。它不只是一个 HTTP Server，而是由请求管理、调度、KV Cache 管理和 Model Executor 组成的推理引擎。沿着一次请求看，它持续重复：**入队 → 分配/复用 KV → Prefill 或 Decode → 采样 → 完成即释放资源**。
+KV Cache 避免在每个 Decode 步骤重复计算历史 Token 的 Key 和 Value，但显存占用会随层数、KV Head 数、Head Dimension、序列长度、Batch 和数据类型线性增长。粗略估算为：
+
+$$
+M_{KV} \approx 2 \times L \times B \times S \times H_{kv} \times D_h \times bytes
+$$
+
+其中系数 2 分别对应 Key 和 Value。GQA/MQA 通过减少 KV Head 数降低缓存占用和 Decode 带宽压力。
+
+**为什么 KV Cache 往往比想象中更贵？** 权重在所有请求之间共享，KV Cache 却基本是每条序列独有，并且随并发数和上下文长度线性增长。因此「模型权重能放进 GPU」不等于「能服务目标并发」。
+
+##### 3.6.3 Block-based KV Cache
+
+如果每个请求一来就按 `max_model_len` 预留一大段连续显存，就像酒店为每位客人都预留一整层楼：客人只住一晚，剩余房间也不能给别人用。Block-based KV Cache 改成按固定大小的「房间」分配，序列变长时再取新块，结束后归还。
+
+物理块在显存中不需要连续，每条序列通过 Block Table 把自己的第 0、1、2 个逻辑块映射到任意可用的物理块。这与操作系统虚拟内存的分页思想类似，因此 PagedAttention 的核心价值不是改变 Attention 数学，而是让 KV Cache 能灵活分配、共享和回收。
+
+核心对象包括：
+
+```text
+Block Pool      管理可用物理块
+Block Table     记录序列的逻辑块映射
+Reference Count 支持多序列共享缓存块
+LRU Metadata    用于缓存复用与淘汰
+```
+
+块越小，尾块浪费越少，但块表、调度和 Kernel 寻址开销更高；块越大则相反，因此需要根据序列长度分布和并发负载选择。
+
+**例子**：若每块存 16 Token，一条 35 Token 的序列占用 3 块，最后一块只用 3 个位置，浪费 13 个位置；但它不会因为之后可能生成到 4k Token，就提前占住 4k Token 的空间。
+
+##### 3.6.4 Public Prefix Reuse
+
+多个请求可能共享相同的 System Prompt、工具定义或公共文档前缀。对已计算的 Token Block 建立内容哈希，新请求按块匹配最长公共前缀，命中后增加引用计数并复用对应 KV Block，只对未命中后缀做 Prefill。
+
+例如 100 个 Agent 请求都携带相同的 8k Token System Prompt 和 Tool Schema，只有末尾的 User Message 不同。没有 Prefix Cache 时，这 8k Token 要做 100 次 Prefill；命中同一副本的 Prefix Cache 后，后续请求可直接引用前缀 KV，只计算用户动态部分。
+
+因此 Prefix Cache 是一种**避免重复 Prefill 计算**的机制，它不会让单条完全新的 Prompt 凭空变快，也不会减少后续 Decode 需要读取的 KV 量。
+
+复用的正确性要求 Token IDs、模型与版本、位置编码相关配置及影响 KV 的推理参数一致。还要防止跨租户错误共享带来的数据泄露和时序侧信道。
+
+##### 3.6.5 LRU 淘汰与调度配合
+
+当空闲块不足时，优先淘汰引用计数为 0 且最久未使用的 Prefix Cache Block。正在被活跃序列引用的块不可淘汰。实现上需要保证「查找、增加引用、释放、淘汰」的并发一致性，并在压力较高时让 Admission Control 与 Scheduler 共同决定是等待、抢占还是拒绝新请求。
+
+评估时不仅要看吞吐，还要同时观察 TTFT、TPOT、P50/P95 延迟、KV Cache 利用率、Prefix Cache 命中率、预占/重算次数和 OOM 率。
+
+#### 3.7 统一 LLM Serving 网关
+
+网关是所有模型服务的统一入口。它不执行模型计算，而是将「调用哪个模型、请求能否进入、送到哪个实例、失败后如何处理」变成确定性工程规则。
+
+```text
+Client
+  → 协议适配
+  → 鉴权与配额
+  → Token 级限流
+  → 模型与实例路由
+  → vLLM / 其他推理后端
+  → SSE 流式返回
+```
+
+##### 3.7.1 模型适配
+
+对上层提供统一的 Chat/Completions/Embeddings 协议，对下层适配不同 Provider 或推理引擎。适配不只是改 URL，还包括：
+
+- messages、Tool Schema、多模态输入和 sampling parameters 的转换；
+- Tool Call、finish reason、usage 和 error code 的归一化；
+- SSE chunk、heartbeat、`[DONE]` 与取消语义的统一；
+- model capability 描述：上下文长度、Tool Calling、JSON Schema、多模态和量化版本。
+
+上层只依赖网关契约，替换底层模型或 vLLM 版本时不需要修改业务代码。
+
+##### 3.7.2 鉴权、路由与限流
+
+**鉴权**不只校验身份，还要将身份映射到租户、允许模型、RPM/TPM 配额、最大上下文和审计策略。
+
+**路由**分两步：先根据模型名和 capability 选择模型池，再根据实例的活跃序列、排队 Token、KV Cache 水位、近期 TTFT 和 Prefix Cache 亲和性选择副本。只用 round-robin 会把 100 Token 和 100k Token 的请求当成同等负载。
+
+**限流**不能只看 QPS，通常同时约束：
+
+```text
+RPM: 每分钟请求数
+TPM: 每分钟输入/输出 Token
+Concurrency: 租户活跃序列数
+Queue Budget: 排队 Token 和最大等待时间
+Request Guardrail: max_model_len、max_tokens、Tool Schema 大小
+```
+
+网关在入队前用对应 tokenizer 统计输入 Token，并用申请的最大输出长度估计资源上界。已经无法在 SLO 内处理时尽早返回 429/503，比让请求在队列中长时间等待更可控。
+
+##### 3.7.3 超时、重试与幂等
+
+一个流式请求需要分开三种超时：
+
+- **Connection Timeout**：无法建立后端连接；
+- **TTFT Timeout**：连接已成功，但首 Token 长时间未返回；
+- **Inter-token Timeout**：流已开始，但相邻 Token 之间长时间无输出。
+
+不能给整个 SSE 请求设一个简单的短超时，否则长回答会被误杀。重试只在「操作幂等 + 总预算未耗尽」时发生，采用指数退避和 jitter，并遵守 `Retry-After`。
+
+首 Token 返回前，纯生成请求可重试到其他实例；首 Token 已返回后，新实例没有原请求的 KV Cache，也不保证重新生成与已输出内容一致，通常只能终止流并返回显式错误。
+
+##### 3.7.4 熔断、降级、健康检查与异常切流
+
+这四个机制是一条联动链路，不需要单独构造一套「高可用架构」：
+
+```text
+健康检查发现实例异常
+  → Router 停止向该实例发送新请求
+  → Circuit Breaker 打开，防止重试风暴
+  → 未开始流式输出的请求切到健康实例
+  → 容量不足时按能力契约降级到备用模型
+  → 故障实例恢复后半开探测，逐步恢复流量
+```
+
+**健康检查**分为：
+
+- liveness：进程和基础通信是否存活；
+- readiness：权重是否加载、GPU 是否健康、队列/KV Cache 是否超高水位，实例能否接新流量；
+- passive health：根据真实请求的超时、502、GPU OOM 和断流率判断。
+
+为了避免一次网络抖动就误切流，需要连续失败阈值、滑动时间窗口、最小样本数和恢复滞回。「30 秒内切流」本质上由以下时间组成：
+
+```text
+T_failover
+  = T_detect       故障被主动/被动检测发现
+  + T_decide       达到阈值并打开熔断器
+  + T_propagate    健康状态传播到各网关副本
+  + T_reroute      新请求选择健康实例
+```
+
+要稳定控制在 30 秒内，不能只把 health-check interval 设为 30 秒，而是要对检测、判定、传播和重路由分别设定预算并演练。
+
+**熔断**保护下游和网关自身；**降级**则在容量或模型不可用时保留有限服务。备用模型必须事先声明 capability，如上下文长度、Tool Calling、JSON Schema 和多模态能力；否则「有响应」不等于「服务可用」。
+
+##### 3.7.5 99.99% 可用性如何定义
+
+99.99% 意味着一年理论不可用时间约为：
+
+$$
+365 \times 24 \times 60 \times (1 - 0.9999) \approx 52.56\text{ 分钟}
+$$
+
+但可用性必须先给出 SLI 口径。一个实用定义是：
+
+$$
+Availability = \frac{Valid\ Requests - Gateway\ Attributed\ Failures}{Valid\ Requests}
+$$
+
+`Gateway Attributed Failures` 可包括网关 5xx、超时、异常断流和路由失败；不应把客户端取消、非法参数和用户配额超限一律算成网关不可用。流式请求也不能在返回 HTTP 200 后就算成功，还要检查是否正常生成首 Token 并完成或有明确 finish reason。
+
+高可用的核心不是「永不失败」，而是失败能被快速发现、不被重试放大、能切到健康实例，并且整个过程可观测、可演练。
+
+**常见问题**
+
+1. **为什么不能把所有超时都重试？**
+   超时时后端可能仍在计算，盲目重试会放大 GPU 压力；流已开始时还会导致内容无法连续。
+2. **熔断和限流的区别是什么？**
+   限流是在请求进入前保护容量；熔断是在下游已经异常时停止继续尝试，防止故障扩散。
+3. **30 秒切流如何验证？**
+   主动注入进程崩溃、GPU OOM、网络不通和高延迟等故障，用 Trace 分别记录 detect、decide、propagate 和 reroute 时刻，对 P95/P99 而不只是平均值验收。
+
+#### 3.8 vLLM 核心架构与推理机制
+
+vLLM 的核心价值是把「单个模型的前向计算」变成「多请求共享 GPU 的高吞吐推理系统」。它不只是一个 HTTP Server，而是由请求管理、调度、KV Cache 管理和 Model Executor 组成的推理引擎。
 
 ```text
 API Server
@@ -1481,7 +1040,7 @@ API Server
 
 不同 vLLM 版本的类名与进程组织会变化，但「Scheduler 决定本轮算什么、KV Manager 决定缓存放哪里、Executor 执行模型前向」的逻辑分层不变。
 
-#### 4.4.1 Continuous Batching
+##### 3.8.1 Continuous Batching
 
 静态 Batching 像「一车人必须一起上车、一起到终点」：只要有一条序列还没生成完，已经结束的位置也无法及时给新请求。
 
@@ -1497,39 +1056,9 @@ step 3: C 结束 → [B, D, E]
 
 它提高的是吞吐和 GPU 利用率，但 batch 过大时单请求 TPOT 与尾延迟会上升，因此仍是吞吐与延迟的取舍。
 
-Continuous Batching 可以抽象为一个逐轮重排的调度循环：
+##### 3.8.2 PagedAttention
 
-```python
-while waiting or running:
-    budget = max_batched_tokens
-    batch = select_decode_requests(running, budget)   # 先保护在线 TPOT
-    budget -= token_cost(batch)
-    batch += select_prefill_chunks(waiting, budget)  # 剩余预算接纳新请求
-
-    outputs = model_executor.step(batch)
-    running, finished = update_sequences(running, outputs)
-    release_blocks(finished)
-```
-
-真实 vLLM 的实现远比这段伪代码复杂，但核心决策已经显现：每轮在 Decode、Prefill 和 KV Block 之间分配预算；完成序列及时退出，新请求不必等待旧 batch 全部结束。
-
-#### 4.4.2 PagedAttention
-
-PagedAttention 解决的是 **很多条长度未知的 KV Cache，怎样塞进有限显存**。
-
-如果按 `max_model_len` 给每个请求预留连续空间，就像客人入住时，无论住多久都先包下一整层酒店：序列提前结束会浪费，序列继续增长又难以扩展，中间还会留下无法利用的小空洞。
-
-PagedAttention 把显存切成固定大小的“房间”。序列只维护逻辑 Block 编号，Block Table 再把它们映射到任意空闲的物理 Block：
-
-```text
-序列 A 的逻辑块： [0] [1] [2]
-                     │   │   │
-Block Table：        7   1   9
-                     │   │   │
-GPU 物理块：   [1] ... [7] [8] [9]
-```
-
-逻辑上连续即可，物理上不必挨在一起。Attention Kernel 读取 Block Table 找到 K/V，因此数学结果不变，改变的是缓存的分配与寻址方式。
+PagedAttention 不是一种新的 Attention 数学公式，而是 KV Cache 的分页存储与访问方法。它将每条序列的逻辑 KV Block 映射到不连续的物理 Block，Attention Kernel 通过 Block Table 找到真实地址。
 
 价值主要有三点：
 
@@ -1537,57 +1066,24 @@ GPU 物理块：   [1] ... [7] [8] [9]
 - 序列边生成边按需申请 Block，结束后立即回收；
 - 通过引用计数共享 Prefix Block，支持 Prefix Cache 和分支序列。
 
-可以把它理解为 Prefix Cache 的“存储地基”：它让多个请求能够引用同一批物理 KV Block，但**前缀如何索引、何时命中、如何淘汰**仍需 APC 等上层机制完成。
+##### 3.8.3 FlashAttention 与 PagedAttention 的区别
 
-Block 也不是越小越好。若每块容纳 16 Token，35 Token 需要 3 块，最后一块浪费 13 个位置；减小 Block 能减少尾部浪费，却会增加 Block Table、调度和 Kernel 寻址开销。
+两者经常被混淆，但解决的问题不同：
 
-#### 4.4.3 FlashAttention 与 PagedAttention 的区别
-
-| 机制 | 一句话定位 | 主要作用阶段 |
+| 机制 | 解决的问题 | 核心思想 |
 |---|---|---|
-| FlashAttention | 减少一次 Attention 内部的 HBM 数据搬运 | 训练与 Prefill 更明显 |
-| PagedAttention | 分页管理多条变长序列的 KV Cache | 在线推理的 KV 管理 |
+| FlashAttention | Attention 计算中 $N\times N$ 中间矩阵读写 HBM 开销大 | Tiling + Online Softmax，在 SRAM 中分块计算 |
+| PagedAttention | 多条变长序列的 KV Cache 难以高效分配 | 逻辑块—物理块映射 |
 
-前者管“怎么算”，后者管“怎么存”，二者可以同时使用。FlashAttention 的计算原理见 4.2。
+FlashAttention 主要优化「Attention 怎么算」，PagedAttention 主要优化「KV Cache 怎么存和怎么找」。Prefill 阶段通常更能从 FlashAttention 的 IO 优化中受益；Decode 阶段 query 通常只有一个或少量 Token，瓶颈更常是读取历史 KV 的显存带宽。
 
-#### 4.4.4 vLLM Automatic Prefix Caching（APC）
+##### 3.8.4 Prefix Caching
 
-APC 解决的是 **不同请求携带相同前缀，却每次都重新做 Prefill** 的问题。例如 100 个 Agent 请求共享同一段 8k Token 的 System Prompt 和 Tool Schema，只有用户问题不同；没有 APC，这 8k Token 会重复计算 100 次。
+vLLM 将已计算的完整 KV Block 按 Token 内容及相关配置建立哈希。新请求命中最长前缀后，只对未命中的后缀做 Prefill。
 
-vLLM 为已经计算完成的 KV Block 建立链式哈希。当前块的 Key 包含前一块 Hash 和本块 Token IDs，因此只有从开头连续相同的 Token 才能命中；LoRA、Multi-modal Input 和租户隔离 Salt 等影响 KV 或安全边界的信息也要进入 Hash。
+它只节省重复 Prefill，不会减少 Decode 需要读取的历史 KV。因此适合 System Prompt、Tool Schema、Few-shot Example 和公共文档前缀高度重复的场景。如果前缀中带有时间戳、随机 ID 或字段顺序不稳定，Token 序列不同就会直接 miss。
 
-```python
-block_hash = hash(
-    parent_block_hash,
-    block_token_ids,
-    model_and_adapter_identity,
-    multimodal_hash,
-    cache_salt,
-)
-```
-
-新请求从左向右查询连续命中的 Block，直接引用其 KV，只计算第一个 Miss 之后的 Token。只缓存完整 Block，因此即使末尾还有几个 Token 相同，也要从最后一个完整命中块之后重新计算。
-
-```text
-已有缓存：[System 1][System 2][Tools][User A]
-新请求：  [System 1][System 2][Tools][User B]
-           └────── 直接复用 ──────┘ └─只计算这里
-```
-
-APC 的收益边界很明确：
-
-- **能优化**：重复 System Prompt、Tool Schema、多轮会话历史、同一长文档上的多次提问，主要降低 TTFT 和 Prefill 算力；
-- **不能优化**：完全不同的 Prompt，以及命中后的 Decode；Decode 仍要读取整段历史 KV；
-- **容易失效**：时间戳、随机 ID、工具顺序或 JSON 序列化不稳定出现在前缀前部，导致后续 Block 全部 Miss；
-- **多副本难点**：某实例有缓存不代表其他实例也有。网关需做 Cache-aware Routing，或引入跨实例 KV 传输，否则 round-robin 会稀释命中率。
-
-APC 使用 Hash Table 做 Block 级精确匹配，查找简单、容易和 PagedAttention 的 Block Pool 结合；缓存压力增大时，只能淘汰引用计数为 0 的 Block，并结合 LRU 回收。
-
-多副本部署时，KV Tensor 通常仍在具体 vLLM 实例的 GPU/CPU Cache 中，不应塞进 Redis。Redis 更适合记录 `prefix_hash → instance_id` 的短期亲和性元数据，帮助网关把请求送到可能命中的健康实例；最终命中仍由 vLLM 校验。实例摘流、模型重载或 Cache 淘汰后，元数据应通过 TTL 或事件及时失效。
-
-它也能缓解 Context Compression 与 Prefix Cache 的冲突。若 Context 按“稳定层 + 历史消息层 + 最近轮次层”组织，并且只低频压缩中间历史层，那么摘要变化时，APC 仍可复用前面的稳定 Block；新摘要冻结后，后续轮次又能复用“稳定层 + 摘要”形成的新前缀。它降低的是局部重算成本，并不能让变化前后的摘要共享 KV。
-
-#### 4.4.5 Speculative Decoding
+##### 3.8.5 Speculative Decoding
 
 自回归 Decode 每次只产生一个 Token，存在强串行依赖。Speculative Decoding 用更快的 draft model 一次猜测多个 Token，target model 再一次并行验证这些候选：
 
@@ -1602,7 +1098,7 @@ Target: 一次前向验证
 
 决定收益的关键指标是 acceptance rate、平均每轮接受 Token 数、draft/target 速度比以及额外 KV Cache 开销。
 
-#### 4.4.6 Chunked Prefill 与 Prefill/Decode 混部
+##### 3.8.6 Chunked Prefill 与 Prefill/Decode 混部
 
 一个超长 Prefill 如果在一轮中独占 GPU，正在 Decode 的用户会长时间收不到下一个 Token。Chunked Prefill 将长 Prompt 分成多个 chunk，Scheduler 可以在两个 chunk 之间插入 Decode：
 
@@ -1613,7 +1109,7 @@ Decode:                [d]       [d]       [d]
 
 这能减少长 Prompt 对 inter-token latency 的干扰，但会增加调度和中间状态管理开销。核心取舍仍然是 Prefill TTFT、Decode TPOT 与整体吞吐。
 
-#### 4.4.7 抢占、Swap 与 Recomputation
+##### 3.8.7 抢占、Swap 与 Recomputation
 
 当 KV Block 不足时，Scheduler 可能需要抢占低优先级或后进入的序列。被抢占序列有两种恢复方式：
 
@@ -1622,15 +1118,15 @@ Decode:                [d]       [d]       [d]
 
 频繁 preemption 通常说明并发、最大上下文或 Token Budget 超出 KV Cache 能力。它不是免费的容量扩展，而是以延迟换取不立即 OOM。
 
-#### 4.4.8 并行推理
+##### 3.8.8 并行推理
 
-- **Tensor Parallel**：一份模型横跨多张 GPU，同一请求由多卡共同完成；常用于模型单卡放不下，也会引入层内集合通信；
-- **Pipeline Parallel**：不同层放在不同 GPU/节点，请求的激活依次经过各 Stage；可容纳更深模型，但单请求要穿过整条流水线；
-- **Replica Serving**：每个副本持有一份完整模型，网关把不同请求分发给不同副本，以扩展集群总吞吐。它在形态上类似 Data Parallel，但推理没有梯度 AllReduce，因此更准确的说法是多副本服务。
+- **Tensor Parallel**：将每层权重和 Attention Head 切到多张 GPU，每层需要 AllReduce/AllGather，适合高带宽机内互联；
+- **Pipeline Parallel**：将不同层放到不同 GPU/节点，通信发生在 Stage 之间，但存在流水线气泡；
+- **Data Parallel / Replica**：每个副本持有完整模型，网关将不同请求路由到不同副本，扩展集群总吞吐。
 
 TP 并非越大越快。它减少每张卡的权重和计算，却引入每层集合通信。当模型已能放入单卡或卡间带宽不足时，增大 TP 可能反而变慢。
 
-#### 4.4.9 常见性能问题
+##### 3.8.9 常见性能问题
 
 | 现象 | 首先检查 | 常见原因 |
 |---|---|---|
@@ -1650,203 +1146,3 @@ TP 并非越大越快。它减少每张卡的权重和计算，却引入每层�
    draft 只负责提议 Token，target 通过接受—拒绝规则校正候选；正确算法下不是直接相信 draft 输出。
 4. **为什么权重量化后仍可能 KV Cache OOM？**
    权重和 KV Cache 是两块独立显存。量化权重释放了模型显存，但 KV 精度、并发数和序列长度不变时，KV 占用仍然会线性增长。
-
-## 五、LLM Serving：服务链路、网关与 Redis
-
-> **主线：**Prefill 决定首 Token 到达时间，Decode 决定后续生成速度；vLLM 在单副本内调度请求并管理 KV，Serving Gateway 在集群层面负责鉴权、路由、限流、故障切流与观测，Redis 主要承担共享限流/熔断状态与前缀亲和元数据。
-
-### 1 在线推理请求全链路
-
-先用一个请求理解整条链路。用户发送「阅读这份 20k Token 的文档并总结」，并要求流式返回：
-
-```text
-1. 网关验证身份、计算 Token、检查配额
-2. Router 选择一个健康且负载合适的 vLLM 副本
-3. Scheduler 将请求排入队列，为它预留 KV Cache Block
-4. Prefill 并行读完 20k Token，生成首个 Token
-5. Decode 逐个生成后续 Token，网关通过 SSE 边生成边返回
-6. 用户点击停止，cancellation 传到 vLLM，序列退出调度
-7. KV Block 引用计数减少，可回收块返回 Block Pool
-```
-
-这条链路有两类调度：网关在多个推理副本之间做**粗粒度调度**，vLLM 在一个副本内对多条序列做**Token 粒度调度**。网关解决「请求送到哪里」，推理引擎解决「GPU 这一轮算哪些 Token」。
-
-#### 1.1 网关与推理引擎的协作边界
-
-推理服务并不是“HTTP Server 调一次 `model.generate()`”，而是两个不同尺度的运行层：
-
-```text
-Gateway：鉴权、限流、模型池选择、副本路由、流式协议、重试与切流
-    ↓
-Inference Engine：请求队列、Prefill/Decode 调度、KV Block 分配、模型前向、采样与停止
-    ↓
-GPU / Model Executor
-```
-
-- **推理引擎**管理单副本内的 GPU，目标是在 TTFT、TPOT 与显存水位约束下完成尽可能多的 Token；
-- **推理网关**管理集群入口，目标是让请求进入兼容、健康、容量合适的副本；
-- TensorRT / ONNX Runtime 更偏单模型图与 Kernel 执行，vLLM 更偏 LLM 的动态批处理与 KV 调度；两者处在不同层次，并不互斥。
-
-引擎持续在每个调度 tick 推进一部分 Token：
-
-```python
-async def engine_step():
-    scheduled = scheduler.schedule()              # 决定本轮推进哪些 Decode / Prefill chunk
-    kv_manager.prepare(scheduled)              # 命中复用或为增长的序列分配 KV Block
-    outputs = await model_executor.forward(scheduled)
-    scheduler.update(outputs)                  # 采样、停止条件与序列状态
-    kv_manager.release_finished(scheduled)     # 仅回收已结束且引用归零的 Block
-    return stream_events(outputs)
-```
-
-主线是：**Scheduler 决定“本轮算谁”，Executor 决定“怎么算”，KV Manager 决定“缓存如何复用、分配与回收”；网关不介入副本内每一轮 Token 调度。**
-
-### 2 统一 LLM Serving 网关
-
-网关是所有模型服务的统一入口。它不执行模型计算，而是将「调用哪个模型、请求能否进入、送到哪个实例、失败后如何处理」变成确定性工程规则。
-
-网关的主线可以压缩为四个连续决策：**接不接（鉴权/配额）→ 调哪个模型（能力匹配）→ 送到哪台副本（负载与缓存亲和）→ 出错后怎么办（流状态决定重试或切流）**。这也是它不同于单纯反向代理或负载均衡器的原因。
-
-![统一 LLM Serving 网关、故障切流与支撑能力](figures/llm-serving-gateway.png)
-
-```text
-Client
-  → 协议适配
-  → 鉴权与配额
-  → Token 级限流
-  → 模型与实例路由
-  → vLLM / 其他推理后端
-  → SSE 流式返回
-```
-
-#### 2.1 模型适配
-
-对上层提供统一的 Chat/Completions/Embeddings 协议，对下层适配不同 Provider 或推理引擎。适配不只是改 URL，还包括：
-
-- messages、Tool Schema、多模态输入和 sampling parameters 的转换；
-- Tool Call、finish reason、usage 和 error code 的归一化；
-- SSE chunk、heartbeat、`[DONE]` 与取消语义的统一；
-- model capability 描述：上下文长度、Tool Calling、JSON Schema、多模态和量化版本。
-
-上层只依赖网关契约，替换底层模型或 vLLM 版本时不需要修改业务代码。
-
-这些能力不应只写在配置说明中，而应成为**版本化 Model Registry** 的一部分：`model-id → capability、上下文上限、后端、实例池、SLO、备用模型`。发布新模型时，先完成权重加载、Warmup 与 readiness 检查，再按小流量 Canary 验证 TTFT、错误率和输出契约，最后才更新默认路由；不要在承接流量的实例上直接替换权重。
-
-#### 2.2 鉴权、路由与限流
-
-**鉴权**不只校验身份，还要将身份映射到租户、允许模型、RPM/TPM 配额、最大上下文和审计策略。
-
-**路由**分两步：先根据模型名和 capability 选择模型池，再根据实例的活跃序列、排队 Token、KV Cache 水位、近期 TTFT 和 Prefix Cache 亲和性选择副本。只用 round-robin 会把 100 Token 和 100k Token 的请求当成同等负载。
-
-**限流**不能只看 QPS，通常同时约束：
-
-```text
-RPM: 每分钟请求数
-TPM: 每分钟输入/输出 Token
-Concurrency: 租户活跃序列数
-Queue Budget: 排队 Token 和最大等待时间
-Request Guardrail: max_model_len、max_tokens、Tool Schema 大小
-```
-
-网关在入队前用对应 tokenizer 统计输入 Token，并用申请的最大输出长度估计资源上界。已经无法在 SLO 内处理时尽早返回 429/503，比让请求在队列中长时间等待更可控。
-
-多网关副本下，限流计数不能只放在单机内存，否则同一租户可以把流量分散到不同网关绕过配额。Redis 常通过 Lua Script 原子地完成“读取水位、补充令牌、扣减令牌、设置 TTL”，实现共享的 Token Bucket：
-
-```text
-rate:{tenant}:{model}:rpm     请求令牌桶
-rate:{tenant}:{model}:tpm     Token 令牌桶
-active:{tenant}:{model}       当前并发数（带租约/过期时间）
-```
-
-一次请求应同时申请 RPM、预估 TPM 和并发额度；任意一项不足就整体拒绝或回滚。仅用 `INCR` 再 `EXPIRE` 的多个命令会有并发窗口，Lua 或事务的意义是让检查与扣减成为一个原子操作。
-
-#### 2.3 超时、重试与幂等
-
-一个流式请求需要分开三种超时：
-
-- **Connection Timeout**：无法建立后端连接；
-- **TTFT Timeout**：连接已成功，但首 Token 长时间未返回；
-- **Inter-token Timeout**：流已开始，但相邻 Token 之间长时间无输出。
-
-不能给整个 SSE 请求设一个简单的短超时，否则长回答会被误杀。重试只在「操作幂等 + 总预算未耗尽」时发生，采用指数退避和 jitter，并遵守 `Retry-After`。
-
-首 Token 返回前，纯生成请求可重试到其他实例；首 Token 已返回后，新实例没有原请求的 KV Cache，也不保证重新生成与已输出内容一致，通常只能终止流并返回显式错误。
-
-网关实现的关键是把“能否重试”绑定到流状态和总时间预算，而不是只根据异常类型判断：
-
-```python
-async def stream_with_failover(request, deadline):
-    emitted = False
-    for backend in router.healthy_candidates(request.model):
-        try:
-            async for chunk in backend.stream(request, deadline=deadline):
-                emitted = True
-                yield chunk
-            return
-        except RetryableError:
-            if emitted or time.monotonic() >= deadline:
-                raise StreamInterrupted()
-            circuit_breaker.record_failure(backend)
-    raise ServiceUnavailable()
-```
-
-实际系统还要传递 cancellation、限制最大尝试次数并使用 request ID 做审计；核心边界始终是：一旦已向客户端输出 Token，就不能静默换实例重新生成。
-
-#### 2.4 熔断、降级、健康检查与异常切流
-
-这四个机制是一条联动链路，不需要单独构造一套「高可用架构」：
-
-```text
-健康检查发现实例异常
-  → Router 停止向该实例发送新请求
-  → Circuit Breaker 打开，防止重试风暴
-  → 未开始流式输出的请求切到健康实例
-  → 容量不足时按能力契约降级到备用模型
-  → 故障实例恢复后半开探测，逐步恢复流量
-```
-
-**健康检查**分为：
-
-- liveness：进程和基础通信是否存活；
-- readiness：权重是否加载、GPU 是否健康、队列/KV Cache 是否超高水位，实例能否接新流量；
-- passive health：根据真实请求的超时、502、GPU OOM 和断流率判断。
-
-健康检查不是每个请求到来时临时发起的同步 RPC，而是网关侧的**异步常驻任务**。它按固定周期探测实例、合并主动与被动信号、更新本地健康表并异步同步给其他网关；请求路由只读取这份健康快照，因此不会把探测耗时加到用户的 TTFT 上。
-
-```python
-async def health_reconciler():
-    while running:
-        for instance in registry.instances():
-            probe = await check_liveness_and_readiness(instance)
-            state = health_policy.merge(probe, passive_errors[instance])
-            health_table.update(instance, state)      # Router 读取本地快照
-            await publish_health_delta(instance, state)  # 异步传播给其他网关
-        await sleep(check_interval)
-```
-
-状态通常按 `healthy → suspect → unhealthy → half-open → healthy` 流转：连续失败才摘流，恢复后先放少量探测流量，避免短暂抖动造成频繁切换。
-
-为了避免一次网络抖动就误切流，需要连续失败阈值、滑动时间窗口、最小样本数和恢复滞回。「30 秒内切流」本质上由以下时间组成：
-
-```text
-T_failover
-  = T_detect       故障被主动/被动检测发现
-  + T_decide       达到阈值并打开熔断器
-  + T_propagate    健康状态传播到各网关副本
-  + T_reroute      新请求选择健康实例
-```
-
-要稳定控制在 30 秒内，不能只把 health-check interval 设为 30 秒，而是要对检测、判定、传播和重路由分别设定预算并演练。
-
-**熔断**保护下游和网关自身；**降级**则在容量或模型不可用时保留有限服务。备用模型必须事先声明 capability，如上下文长度、Tool Calling、JSON Schema 和多模态能力；否则「有响应」不等于「服务可用」。
-
-Redis 也可以保存网关副本间共享的熔断状态，例如：
-
-```text
-circuit:{model}:{instance}
-  → state=open, failures=12, opened_at=..., probe_owner=...
-```
-
-每个网关先在本地快速判断，失败统计和 `open/half-open` 状态再同步到 Redis，避免某个网关已经熔断、其他网关仍持续把请求打向故障实例。半开阶段可用 `SET key value NX EX ...` 抢占少量探测权，防止所有网关同时探测造成流量尖峰。
-
-Redis 本身也可能故障，所以它不应成为推理链路的单点：限流可按安全策略选择短时本地保守额度或 fail-closed；熔断应继续依赖本地状态和健康检查；Prefix 元数据不可用时则退化为普通负载路由，只损失命中率，不影响请求正确性。
